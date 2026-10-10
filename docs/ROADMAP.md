@@ -20,6 +20,8 @@ Each item is complete only when its acceptance criteria pass and fmt/clippy/test
 
 ## Phase 3 - Minimal GUI
 - [ ] History table (virtualized), message viewer/editor, intercept panel, scope settings.
+  Proxy settings must expose the same options as the CLI, including `insecure_upstream` (skip origin
+  certificate verification): off by default, with a visible warning whenever it is on.
   Acceptance: 100k rows scroll smoothly; no UI blocking during proxying.
 
 ## Phase 4 - Replay, Codec, Diff

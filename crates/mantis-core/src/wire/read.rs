@@ -88,6 +88,16 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         }
     }
 
+    /// Take the bytes read from the stream but not yet consumed by a message.
+    pub fn take_buffered(&mut self) -> BytesMut {
+        self.buf.split()
+    }
+
+    /// Mutable access to the underlying stream (bypasses the buffer).
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
     /// Give back the stream and any bytes read but not consumed.
     pub fn into_parts(self) -> (R, BytesMut) {
         (self.inner, self.buf)

@@ -4,8 +4,10 @@
 //! and every exchange is stored raw. Plain HTTP only: `CONNECT` is answered
 //! with 501 until HTTPS interception exists.
 
+pub mod ca;
 mod conn;
 mod target;
+mod tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,6 +30,14 @@ pub struct Config {
     pub scope: Option<Scope>,
     /// Message size limits.
     pub limits: Limits,
+    /// CA used to intercept HTTPS. Without one, `CONNECT` gets a 501.
+    pub ca: Option<Arc<ca::Ca>>,
+    /// Skip verification of origin certificates. Off by default; meant for lab
+    /// targets with self-signed certificates. Frontends must expose this
+    /// same option and make its state obvious.
+    pub insecure_upstream: bool,
+    /// Extra trusted roots for origin certificates, in addition to the OS store.
+    pub extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl Default for Config {
@@ -37,6 +47,9 @@ impl Default for Config {
             allow_non_loopback: false,
             scope: None,
             limits: Limits::default(),
+            ca: None,
+            insecure_upstream: false,
+            extra_upstream_roots: Vec::new(),
         }
     }
 }
@@ -47,6 +60,9 @@ pub enum ProxyError {
     /// Binding or socket setup failed.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
+    /// TLS setup failed.
+    #[error("tls: {0}")]
+    Tls(#[from] rustls::Error),
     /// A non-loopback listen address was given without opting in.
     #[error("refusing to listen on non-loopback address {0} without allow_non_loopback")]
     NonLoopback(SocketAddr),
@@ -89,6 +105,13 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
     }
     let listener = TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
+    let mitm = match &config.ca {
+        Some(ca) => Some(tls::Mitm {
+            certs: Arc::new(tls::CertCache::new(ca.clone())),
+            client: tls::client_config(config.insecure_upstream, &config.extra_upstream_roots)?,
+        }),
+        None => None,
+    };
     let (events, _) = broadcast::channel(256);
     let (log_tx, log_rx) = mpsc::channel::<Exchange>(1024);
     let writer = std::thread::Builder::new()
@@ -102,6 +125,7 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         scope: config.scope,
         limits: config.limits,
         log: log_tx,
+        mitm,
     });
     let (stop, mut stopped) = oneshot::channel();
     let accept = tokio::spawn(async move {

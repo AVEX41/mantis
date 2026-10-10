@@ -212,15 +212,19 @@ impl Rule {
         &self.spec
     }
 
-    fn matches(&self, t: &Target<'_>) -> bool {
-        let host = norm_host(t.host);
+    /// Host and port match, ignoring the path.
+    fn matches_endpoint(&self, host: &str, port: u16) -> bool {
+        let host = norm_host(host);
         let host_ok = match &self.host {
             HostPat::Name(n) => *n == host,
             HostPat::Suffix(s) => host.len() > s.len() && host.ends_with(s.as_str()),
             HostPat::Ip(ip) => host.parse::<IpAddr>().is_ok_and(|h| h == *ip),
         };
-        host_ok
-            && (self.ports.is_empty() || self.ports.iter().any(|r| r.contains(&t.port)))
+        host_ok && (self.ports.is_empty() || self.ports.iter().any(|r| r.contains(&port)))
+    }
+
+    fn matches(&self, t: &Target<'_>) -> bool {
+        self.matches_endpoint(t.host, t.port)
             && self
                 .path
                 .as_ref()
@@ -283,6 +287,21 @@ impl Scope {
         } else {
             Verdict::OutOfScope
         }
+    }
+
+    /// Could some path on this host and port be in scope? Used when the path is
+    /// not known yet (a `CONNECT` tunnel). True if an include rule matches the
+    /// endpoint and no path-less exclude rule does; path-restricted excludes
+    /// are left to the per-request [`Scope::check`].
+    pub fn may_match(&self, host: &str, port: u16) -> bool {
+        let hit = |a: Action, any_path: bool| {
+            self.rules.iter().any(|r| {
+                r.spec.action == a
+                    && (!any_path || r.path.is_none())
+                    && r.matches_endpoint(host, port)
+            })
+        };
+        hit(Action::Include, false) && !hit(Action::Exclude, true)
     }
 
     /// Gate for active tools. Out-of-scope targets pass only with
@@ -405,6 +424,21 @@ mod tests {
                 Verdict::InScope(_)
             ));
         }
+    }
+
+    #[test]
+    fn may_match_ignores_paths_but_honours_blanket_excludes() {
+        let s = scope(vec![
+            rule(Action::Include, "*.example.com", &["443"], Some("/api/.*")),
+            rule(Action::Exclude, "admin.example.com", &[], None),
+            rule(Action::Exclude, "x.example.com", &[], Some("/secret")),
+        ]);
+        assert!(s.may_match("www.example.com", 443)); // include has a path rule; endpoint still possible
+        assert!(!s.may_match("www.example.com", 80));
+        assert!(!s.may_match("admin.example.com", 443)); // whole host excluded
+        assert!(s.may_match("x.example.com", 443)); // only one path excluded
+        assert!(!s.may_match("other.org", 443));
+        assert!(!Scope::new().may_match("a", 1));
     }
 
     #[test]

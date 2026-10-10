@@ -381,3 +381,11 @@ proptest! {
         });
     }
 }
+
+#[tokio::test]
+async fn take_buffered_returns_unconsumed_bytes() {
+    let mut r = reader(b"GET / HTTP/1.1\r\n\r\nleftover", 1 << 16);
+    r.read_request().await.unwrap().unwrap();
+    assert_eq!(&r.take_buffered()[..], b"leftover");
+    assert!(r.take_buffered().is_empty());
+}

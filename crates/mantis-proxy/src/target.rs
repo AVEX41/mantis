@@ -19,6 +19,31 @@ pub(crate) enum Reject {
     Bad,
 }
 
+/// Where a `CONNECT` asks to tunnel to (`host:port`, default port 443).
+pub(crate) fn connect_target(raw: &[u8], v: &RequestView) -> Option<(String, u16)> {
+    let t = std::str::from_utf8(&raw[v.target.clone()?]).ok()?;
+    host_port(t, 443).ok()
+}
+
+/// Destination of a request read inside an intercepted TLS tunnel: the host
+/// and port come from the `CONNECT`, the target is the path as sent.
+pub(crate) fn tunneled(raw: &[u8], v: &RequestView, host: &str, port: u16) -> Result<Dest, Reject> {
+    if v.method.as_ref().map(|r| &raw[r.clone()]) == Some(b"CONNECT") {
+        return Err(Reject::Connect);
+    }
+    let path = v
+        .target
+        .as_ref()
+        .and_then(|r| std::str::from_utf8(&raw[r.clone()]).ok())
+        .filter(|p| !p.is_empty())
+        .ok_or(Reject::Bad)?;
+    Ok(Dest {
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
+    })
+}
+
 /// Resolve the destination from an absolute-form target (`http://host/path`)
 /// or, for origin-form targets, the `Host` header. The raw request is not changed.
 pub(crate) fn resolve(raw: &[u8], v: &RequestView) -> Result<Dest, Reject> {
@@ -34,7 +59,7 @@ pub(crate) fn resolve(raw: &[u8], v: &RequestView) -> Result<Dest, Reject> {
         let rest = &target[7..];
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest[..end].rsplit('@').next().unwrap_or("");
-        let (host, port) = host_port(authority)?;
+        let (host, port) = host_port(authority, 80)?;
         let tail = &rest[end..];
         let path = if tail.starts_with('/') {
             tail.to_string()
@@ -46,7 +71,7 @@ pub(crate) fn resolve(raw: &[u8], v: &RequestView) -> Result<Dest, Reject> {
         let host_hdr = first_header(raw, &v.headers, b"host")
             .and_then(|h| std::str::from_utf8(h).ok())
             .ok_or(Reject::Bad)?;
-        let (host, port) = host_port(host_hdr)?;
+        let (host, port) = host_port(host_hdr, 80)?;
         Ok(Dest {
             host,
             port,
@@ -64,7 +89,7 @@ fn first_header<'a>(raw: &'a [u8], headers: &[Header], name: &[u8]) -> Option<&'
         .map(|h| &raw[h.value.clone()])
 }
 
-fn host_port(s: &str) -> Result<(String, u16), Reject> {
+fn host_port(s: &str, default_port: u16) -> Result<(String, u16), Reject> {
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
         let (h, after) = rest.split_once(']').ok_or(Reject::Bad)?;
         (h, after.strip_prefix(':'))
@@ -79,7 +104,7 @@ fn host_port(s: &str) -> Result<(String, u16), Reject> {
         return Err(Reject::Bad);
     }
     let port = match port {
-        None => 80,
+        None => default_port,
         Some(p) => p
             .parse::<u16>()
             .ok()
@@ -141,6 +166,36 @@ mod tests {
             dest("a.com", 81, "/p")
         );
         assert_eq!(r("GET /p HTTP/1.1\r\n\r\n"), Err(Reject::Bad));
+    }
+
+    #[test]
+    fn connect_and_tunnel_targets() {
+        let raw = b"CONNECT a.com:8443 HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            connect_target(raw, &RequestView::parse(raw)),
+            Some(("a.com".into(), 8443))
+        );
+        let raw = b"CONNECT a.com HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            connect_target(raw, &RequestView::parse(raw)),
+            Some(("a.com".into(), 443))
+        );
+        let raw = b"CONNECT [::1]:9 HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            connect_target(raw, &RequestView::parse(raw)),
+            Some(("::1".into(), 9))
+        );
+        let raw = b"GET /x?y HTTP/1.1\r\n\r\n";
+        let d = tunneled(raw, &RequestView::parse(raw), "h", 443).unwrap();
+        assert_eq!(
+            (d.host.as_str(), d.port, d.path.as_str()),
+            ("h", 443, "/x?y")
+        );
+        let raw = b"CONNECT x:1 HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            tunneled(raw, &RequestView::parse(raw), "h", 443),
+            Err(Reject::Connect)
+        );
     }
 
     #[test]
