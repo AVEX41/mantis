@@ -1,8 +1,8 @@
-//! Intercepting HTTP proxy: listener, request forwarding and history logging.
+//! Intercepting HTTP/HTTPS/WebSocket proxy: listener, request forwarding and history logging.
 //!
 //! Requests and responses are forwarded byte-for-byte (see `mantis_core::wire`)
-//! and every exchange is stored raw. Plain HTTP only: `CONNECT` is answered
-//! with 501 until HTTPS interception exists.
+//! and every exchange is stored raw. `CONNECT` targets are intercepted with the
+//! local CA when `Config::ca` is set; HTTP/2 is downgraded to HTTP/1.1.
 
 pub mod ca;
 mod conn;
