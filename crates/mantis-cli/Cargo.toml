@@ -13,3 +13,8 @@ mantis-fuzz = { path = "../mantis-fuzz" }
 mantis-entropy = { path = "../mantis-entropy" }
 mantis-scan = { path = "../mantis-scan" }
 mantis-ext = { path = "../mantis-ext" }
+clap = { version = "4.6.7", features = ["derive"] }
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }

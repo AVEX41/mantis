@@ -136,6 +136,18 @@ impl Store {
         .transpose()
     }
 
+    /// Fetch one row summary without loading the raw bodies.
+    pub fn summary(&self, id: i64) -> Result<Option<Summary>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, ts, source, host, port, tls, method, path, status FROM exchanges WHERE id = ?1",
+                [id],
+                summary_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     /// List summaries, newest first.
     pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<Summary>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -244,6 +256,8 @@ mod tests {
         assert_eq!(l[1].path.as_deref(), Some("/a"));
         assert_eq!((l[0].status, l[1].status), (None, Some(302)));
         assert_eq!(s.list(1, 1).unwrap()[0].id, a);
+        assert_eq!(s.summary(a).unwrap(), Some(l[1].clone()));
+        assert_eq!(s.summary(99).unwrap(), None);
     }
 
     #[test]

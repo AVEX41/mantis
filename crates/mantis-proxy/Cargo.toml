@@ -6,4 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-mantis-core = { path = "../mantis-core" }
+bytes = "1.12.1"
+mantis-core = { version = "0.0.0", path = "../mantis-core" }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", default-features = false, features = ["net", "time", "rt-multi-thread", "sync", "io-util", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["net", "time", "rt-multi-thread", "sync", "io-util", "macros"] }

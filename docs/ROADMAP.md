@@ -13,7 +13,7 @@ Each item is complete only when its acceptance criteria pass and fmt/clippy/test
 - [x] Scope model (include/exclude by host, port, path regex).
 
 ## Phase 2 - Proxy
-- [ ] HTTP proxy on localhost, logging to SQLite.
+- [x] HTTP proxy on localhost, logging to SQLite.
 - [ ] CA generation, export, per-host leaf certs, HTTPS interception. Acceptance: browser with CA loads an HTTPS site through the proxy.
 - [ ] Intercept queue (forward/drop/edit) and match-and-replace.
 - [ ] WebSocket capture. HTTP/2 support or documented downgrade.
