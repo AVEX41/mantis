@@ -5,6 +5,7 @@
 //! anything. The writer puts caller-supplied bytes on the stream verbatim.
 //! Neither goes through `hyper`.
 
+mod length;
 mod read;
 mod write;
 pub mod ws;
@@ -12,6 +13,7 @@ pub mod ws;
 #[cfg(test)]
 mod tests;
 
+pub use length::{fix_content_length, Fix};
 pub use read::{detect_framing, Framing, Kind, Limits, Message, Reader};
 pub use write::write_raw;
 

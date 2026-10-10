@@ -28,6 +28,23 @@ A table of include/exclude rules (host, ports, path regex) with inline validatio
 interception and rewriting to the rules; turn it off to put everything in scope. "Apply to running proxy"
 takes effect immediately; exchanges already in flight keep the verdict they started with.
 
+## Intercept page
+Switch on **Hold requests** and/or **Hold responses** (the proxy must be running). In-scope messages wait
+in the list on the left; the tab label and status bar show how many. Select one to read or edit it:
+- **Forward** sends it unchanged, ignoring any edits in the box.
+- **Send edited** sends the text exactly as written. It is enabled once the text differs.
+- **Drop** discards it and closes the client connection with no reply.
+- **Fix Content-Length** sets the header to the body length. It is a deliberate button: nothing is ever
+  repaired automatically, so you can still send a wrong length on purpose.
+
+The editor shows bytes as text: line feeds are line breaks, and `\r`, `\t`, `\\` and `\xNN` stand for CR,
+tab, backslash and any other byte (invalid UTF-8, control characters, and invisible or direction-changing
+characters appear as `\xNN`). Every byte string round-trips unchanged; a malformed escape is reported and
+nothing is sent. Typing a bare line feed sends a bare LF, which is how you craft such requests.
+Messages over 256 KiB are read-only (you can still forward or drop them). If a client gives up while its
+message is held, the entry disappears. Editing cannot change where a request goes. Switching a switch off
+forwards everything waiting in that direction. The switches start off every time.
+
 ## Remembered between runs
 Last project, listen address, CA directory and the scope rules. Not remembered: the insecure and
 network-access switches, and whether the proxy was running.

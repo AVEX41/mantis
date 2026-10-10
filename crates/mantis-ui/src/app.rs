@@ -15,6 +15,7 @@ use crate::backend::{Backend, Cmd, Event};
 use crate::bench::Bench;
 use crate::data::{self, DataHandle, Resp};
 use crate::history::HistoryModel;
+use crate::intercept::InterceptModel;
 use crate::scope_editor::ScopeEditor;
 use crate::settings::ProxySettings;
 use crate::timefmt::format_utc;
@@ -138,6 +139,7 @@ pub(crate) enum Page {
     History,
     Proxy,
     Scope,
+    Intercept,
 }
 
 /// What the background proxy is doing, as far as the UI knows.
@@ -187,6 +189,7 @@ pub struct App {
     pub(crate) fingerprint: Option<String>,
     /// The running proxy was started without origin certificate verification.
     pub(crate) running_insecure: bool,
+    pub(crate) intercept: InterceptModel,
 }
 
 fn status_color(code: u16) -> Color32 {
@@ -253,6 +256,7 @@ impl App {
             ca_export: String::new(),
             fingerprint: None,
             running_insecure: false,
+            intercept: InterceptModel::default(),
         };
         if let Some(p) = path {
             app.open(ctx, &p);
@@ -320,12 +324,16 @@ impl App {
                 break;
             };
             match ev {
+                Event::Held(h) => self.intercept.on_held(h),
+                Event::Resolved(id) => self.intercept.on_resolved(id),
                 Event::Started { addr, fingerprint } => {
+                    self.intercept.clear();
                     self.proxy = ProxyState::Running(addr);
                     self.fingerprint = Some(fingerprint);
                     self.error = None;
                 }
                 Event::Stopped => {
+                    self.intercept.clear();
                     self.proxy = ProxyState::Stopped;
                     self.running_insecure = false;
                 }
@@ -468,6 +476,13 @@ impl App {
                 ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.selectable_value(&mut self.page, Page::Proxy, "Proxy");
                 ui.selectable_value(&mut self.page, Page::Scope, "Scope");
+                let held = self.intercept.entries().len();
+                let label = if held > 0 {
+                    format!("Intercept ({held})")
+                } else {
+                    "Intercept".to_string()
+                };
+                ui.selectable_value(&mut self.page, Page::Intercept, label);
             });
             if let Some(e) = &self.error {
                 ui.colored_label(Color32::from_rgb(230, 100, 100), e);
@@ -519,6 +534,11 @@ impl App {
                 if self.scope.enabled {
                     ui.separator();
                     ui.label("scope on");
+                }
+                let held = self.intercept.entries().len();
+                if held > 0 {
+                    ui.separator();
+                    ui.colored_label(Color32::from_rgb(235, 170, 70), format!("{held} held"));
                 }
                 if self.settings.allow_non_loopback {
                     ui.separator();
@@ -715,6 +735,7 @@ impl eframe::App for App {
             }
             Page::Proxy => self.proxy_page(ui),
             Page::Scope => self.scope_page(ui),
+            Page::Intercept => self.intercept_page(ui),
         });
     }
 

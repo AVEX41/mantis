@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::app::{App, ProxyState};
+use mantis_proxy::Dir;
+
 use crate::backend::Cmd;
+use crate::viewer::RawView;
 
 const WARN: Color32 = Color32::from_rgb(235, 170, 70);
 const BAD: Color32 = Color32::from_rgb(230, 100, 100);
@@ -171,4 +174,132 @@ impl App {
             ui.weak("Same format as `mantis-cli proxy --scope`.");
         });
     }
+
+    pub(crate) fn intercept_page(&mut self, ui: &mut egui::Ui) {
+        let running = matches!(self.proxy, ProxyState::Running(_));
+        ui.heading("Intercept");
+        ui.horizontal(|ui| {
+            let (mut req, mut resp) = (self.intercept.hold_requests, self.intercept.hold_responses);
+            let a = ui
+                .add_enabled(running, egui::Checkbox::new(&mut req, "Hold requests"))
+                .changed();
+            let b = ui
+                .add_enabled(running, egui::Checkbox::new(&mut resp, "Hold responses"))
+                .changed();
+            if a {
+                self.intercept.hold_requests = req;
+                self.backend.send(Cmd::SetIntercept {
+                    dir: Dir::Request,
+                    on: req,
+                });
+            }
+            if b {
+                self.intercept.hold_responses = resp;
+                self.backend.send(Cmd::SetIntercept {
+                    dir: Dir::Response,
+                    on: resp,
+                });
+            }
+            if !running {
+                ui.colored_label(WARN, "start the proxy (Proxy page) to intercept");
+            } else if req || resp {
+                ui.weak(
+                    "Only in-scope traffic is held. Turning a switch off forwards what is waiting.",
+                );
+            }
+        });
+        ui.separator();
+        if self.intercept.entries().is_empty() {
+            ui.weak("Nothing is waiting.");
+            return;
+        }
+        let mut chosen = None;
+        let mut action = None;
+        ui.columns(2, |cols| {
+            // Left: the queue.
+            egui::ScrollArea::vertical().id_salt("held-list").show(&mut cols[0], |ui| {
+                let selected = self.intercept.selected();
+                for h in self.intercept.entries() {
+                    let first = String::from_utf8_lossy(h.raw.split(|&b| b == b'\n').next().unwrap_or(&[])).trim_end().chars().take(80).collect::<String>();
+                    let kind = if h.dir == Dir::Request { "REQ" } else { "RESP" };
+                    let label = format!("#{} {kind} {}:{}  {first}", h.id, h.host, h.port);
+                    if ui.selectable_label(selected == Some(h.id), label).clicked() {
+                        chosen = Some(h.id);
+                    }
+                }
+            });
+            // Right: the selected message.
+            let ui = &mut cols[1];
+            let Some(held) = self.intercept.selected().and_then(|id| self.intercept.entries().iter().find(|h| h.id == id)).map(|h| (h.dir, h.host.clone(), h.port, h.tls)) else { return };
+            let (dir, host, port, tls) = held;
+            let scheme = if tls { "https" } else { "http" };
+            ui.label(RichText::new(format!("{} to {scheme}://{host}:{port}", if dir == Dir::Request { "Request" } else { "Response" })).strong());
+            let Some(ed) = self.intercept.editor_mut() else { return };
+            ui.horizontal(|ui| {
+                if ui.button("Forward").on_hover_text("Send it unchanged").clicked() {
+                    action = Some(Action::Forward);
+                }
+                if ui.add_enabled(ed.is_modified(), egui::Button::new("Send edited")).on_hover_text("Send the text below exactly as written").clicked() {
+                    action = Some(Action::SendEdited);
+                }
+                if ui.button("Drop").on_hover_text("Discard it and close the client connection").clicked() {
+                    action = Some(Action::Drop);
+                }
+                if ui.add_enabled(ed.editable, egui::Button::new("Fix Content-Length")).on_hover_text("Set Content-Length to the body length; edits are never repaired automatically").clicked() {
+                    action = Some(Action::FixLength);
+                }
+            });
+            if let Some(s) = &ed.status {
+                ui.colored_label(WARN, s);
+            }
+            ui.weak("Line feeds are line breaks; \\r \\t \\\\ and \\xNN stand for CR, tab, backslash and any byte.");
+            if let Some(view) = &ed.preview {
+                preview(ui, view, ed.original_len());
+            } else {
+                egui::ScrollArea::vertical().id_salt("held-editor").auto_shrink(false).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut ed.text).code_editor().desired_width(f32::INFINITY).desired_rows(24).lock_focus(true));
+                });
+            }
+        });
+        if let Some(id) = chosen {
+            self.intercept.select(id);
+        }
+        let decision = match action {
+            Some(Action::Forward) => self.intercept.forward(),
+            Some(Action::Drop) => self.intercept.drop_selected(),
+            Some(Action::SendEdited) => self.intercept.send_edited(),
+            Some(Action::FixLength) => {
+                self.intercept.fix_content_length();
+                None
+            }
+            None => None,
+        };
+        if let Some((id, decision)) = decision {
+            self.backend.send(Cmd::Decide { id, decision });
+        }
+    }
+}
+
+enum Action {
+    Forward,
+    SendEdited,
+    Drop,
+    FixLength,
+}
+
+/// Read-only view for messages too large to edit.
+fn preview(ui: &mut egui::Ui, view: &RawView, len: usize) {
+    ui.colored_label(
+        WARN,
+        format!("{len} bytes: too large to edit here. You can forward or drop it."),
+    );
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    egui::ScrollArea::both()
+        .id_salt("held-preview")
+        .auto_shrink(false)
+        .show_rows(ui, row_h, view.rows(), |ui, range| {
+            for i in range {
+                ui.add(egui::Label::new(RichText::new(view.row(i)).monospace()).extend());
+            }
+        });
 }

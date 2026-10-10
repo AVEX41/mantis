@@ -23,5 +23,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
+bytes = "1.12.1"
 proptest = "1.11.0"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }

@@ -457,3 +457,43 @@ async fn an_unmatched_client_read_is_not_confused_with_a_disconnect() {
     assert_eq!(all, OK5);
     rig.finish().await;
 }
+
+async fn next_resolved(rx: &mut broadcast::Receiver<u64>, why: &str) -> u64 {
+    match tokio::time::timeout(T, rx.recv()).await {
+        Ok(Ok(id)) => id,
+        other => panic!("no resolved event: {why} ({other:?})"),
+    }
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn resolved_events_fire_once_per_held_message_however_it_ends() {
+    let origin = Origin::start(&[OK5]).await;
+    let mut rig = Rig::start(None, vec![]).await;
+    let mut resolved = rig.intercept.subscribe_resolved();
+    rig.intercept.set_enabled(Dir::Request, true);
+    // Decided.
+    let client = spawn_client(rig.addr(), get(origin.addr, "/a"));
+    let h1 = rig.next_held().await;
+    rig.intercept.decide(h1.id, Decision::Forward);
+    assert_eq!(next_resolved(&mut resolved, "decided").await, h1.id);
+    done(client).await;
+
+    // Released by turning interception off.
+    let client = spawn_client(rig.addr(), get(origin.addr, "/b"));
+    let h2 = rig.next_held().await;
+    rig.intercept.set_enabled(Dir::Request, false);
+    assert_eq!(next_resolved(&mut resolved, "released").await, h2.id);
+    done(client).await;
+
+    // The client went away.
+    rig.intercept.set_enabled(Dir::Request, true);
+    let mut s = TcpStream::connect(rig.addr()).await.unwrap();
+    write_raw(&mut s, &get(origin.addr, "/c")).await.unwrap();
+    let h3 = rig.next_held().await;
+    s.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(s);
+    assert_eq!(next_resolved(&mut resolved, "client reset").await, h3.id);
+    assert!(rig.intercept.pending().is_empty());
+    rig.finish().await;
+}

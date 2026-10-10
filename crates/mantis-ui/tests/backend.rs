@@ -46,6 +46,17 @@ async fn next(b: &Backend) -> Event {
     }
 }
 
+/// Next `Held` event, acknowledging any `Logged` that arrives first.
+async fn next_held(b: &Backend) -> mantis_proxy::intercept::Held {
+    loop {
+        match next(b).await {
+            Event::Held(h) => return h,
+            Event::Logged => b.ack_logged(),
+            other => panic!("expected Held, got {other:?}"),
+        }
+    }
+}
+
 async fn quiet(b: &Backend) -> bool {
     tokio::time::sleep(Duration::from_millis(300)).await;
     b.try_recv().is_none()
@@ -201,5 +212,122 @@ async fn dropping_the_backend_stops_the_proxy() {
     assert!(TcpStream::connect(addr).await.is_ok());
     tokio::task::spawn_blocking(move || drop(b)).await.unwrap();
     assert!(TcpStream::connect(addr).await.is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An origin that records each raw request it receives.
+async fn recording_origin() -> (SocketAddr, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                return;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                log.lock().unwrap().push(buf[..n].to_vec());
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, seen)
+}
+
+async fn send_in_background(proxy: SocketAddr, raw: Vec<u8>) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut s = TcpStream::connect(proxy).await.unwrap();
+        s.write_all(&raw).await.unwrap();
+        let mut all = Vec::new();
+        let _ = tokio::time::timeout(T, s.read_to_end(&mut all)).await;
+        all
+    })
+}
+
+#[tokio::test]
+async fn intercept_through_the_backend_edit_forward_and_drop() {
+    use mantis_proxy::intercept::Decision;
+    use mantis_proxy::Dir;
+
+    let dir = std::env::temp_dir().join(format!("mantis-ui-backend-icpt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let b = Backend::spawn(|| {}).unwrap();
+    let (origin, seen) = recording_origin().await;
+    b.send(Cmd::Start(config(
+        &dir.join("p.db"),
+        &dir.join("ca"),
+        "127.0.0.1:0",
+        None,
+    )));
+    let Event::Started { addr, .. } = next(&b).await else {
+        panic!()
+    };
+    b.send(Cmd::SetIntercept {
+        dir: Dir::Request,
+        on: true,
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Edit: the origin receives exactly the edited bytes.
+    let req = format!("GET http://{origin}/a HTTP/1.1\r\nHost: {origin}\r\n\r\n").into_bytes();
+    let client = send_in_background(addr, req.clone()).await;
+    let h = next_held(&b).await;
+    assert_eq!((h.dir, &h.raw[..]), (Dir::Request, &req[..]));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing reaches the origin while held"
+    );
+    let edited = bytes::Bytes::from(format!(
+        "GET http://{origin}/edited HTTP/1.1\nHost: x\nA: \x01\n\n"
+    ));
+    b.send(Cmd::Decide {
+        id: h.id,
+        decision: Decision::Edited(edited.clone()),
+    });
+    assert_eq!(next(&b).await, Event::Resolved(h.id));
+    assert!(client.await.unwrap().starts_with(b"HTTP/1.1 200"));
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got, vec![edited.to_vec()]);
+    // The proxy's Logged event for that exchange is also delivered.
+    assert_eq!(next(&b).await, Event::Logged);
+    b.ack_logged();
+
+    // Drop: the client gets nothing and the origin never sees it.
+    let client = send_in_background(addr, req.clone()).await;
+    let h = next_held(&b).await;
+    b.send(Cmd::Decide {
+        id: h.id,
+        decision: Decision::Drop,
+    });
+    assert_eq!(next(&b).await, Event::Resolved(h.id));
+    assert!(client.await.unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // Turning interception off releases what is waiting.
+    let client = send_in_background(addr, req).await;
+    let h = next_held(&b).await;
+    b.send(Cmd::SetIntercept {
+        dir: Dir::Request,
+        on: false,
+    });
+    loop {
+        match next(&b).await {
+            Event::Resolved(id) if id == h.id => break,
+            Event::Logged => b.ack_logged(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(client.await.unwrap().starts_with(b"HTTP/1.1 200"));
+    b.send(Cmd::Stop);
+    drop(b);
     let _ = std::fs::remove_dir_all(&dir);
 }

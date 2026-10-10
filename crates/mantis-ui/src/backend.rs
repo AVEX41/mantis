@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use mantis_core::{Scope, Store};
 use mantis_proxy::ca::Ca;
-use mantis_proxy::{serve, Config, ProxyHandle};
+use mantis_proxy::intercept::{Decision, Held};
+use mantis_proxy::{serve, Config, Dir, ProxyHandle};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::settings::StartConfig;
@@ -25,6 +26,20 @@ pub enum Cmd {
     Stop,
     /// Replace the scope of the running proxy.
     SetScope(Option<Scope>),
+    /// Hold (or stop holding) requests or responses.
+    SetIntercept {
+        /// Which direction.
+        dir: Dir,
+        /// On or off. Turning off forwards everything held in that direction.
+        on: bool,
+    },
+    /// Resolve a held message.
+    Decide {
+        /// Id from [`Event::Held`].
+        id: u64,
+        /// What to do with it.
+        decision: Decision,
+    },
     /// Write the CA certificate (never the key) to `out`, creating the CA if needed.
     ExportCa {
         /// CA directory; `None` for the default.
@@ -50,6 +65,10 @@ pub enum Event {
     Stopped,
     /// At least one exchange was stored since the last [`Backend::ack_logged`].
     Logged,
+    /// A message is waiting for a decision.
+    Held(Held),
+    /// A held message stopped waiting (decided, released, or its client left).
+    Resolved(u64),
     /// The CA certificate was written.
     CaExported {
         /// Where.
@@ -148,18 +167,41 @@ impl Emit {
 
 async fn run(mut cmds: UnboundedReceiver<Cmd>, emit: Emit, logged: Arc<AtomicBool>) {
     let mut proxy: Option<ProxyHandle> = None;
-    let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             Cmd::Start(_) if proxy.is_some() => emit.error("the proxy is already running"),
             Cmd::Start(cfg) => match start(cfg).await {
                 Ok((handle, fingerprint)) => {
                     let (mut sub, e, flag) = (handle.subscribe(), emit.clone(), logged.clone());
-                    forwarder = Some(tokio::spawn(async move {
+                    tasks.push(tokio::spawn(async move {
                         use tokio::sync::broadcast::error::RecvError;
                         while let Ok(_) | Err(RecvError::Lagged(_)) = sub.recv().await {
                             if !flag.swap(true, Ordering::SeqCst) {
                                 e.send(Event::Logged);
+                            }
+                        }
+                    }));
+                    let queue = handle.intercept();
+                    let (mut held, e) = (queue.subscribe(), emit.clone());
+                    tasks.push(tokio::spawn(async move {
+                        use tokio::sync::broadcast::error::RecvError;
+                        loop {
+                            match held.recv().await {
+                                Ok(h) => e.send(Event::Held(h)),
+                                Err(RecvError::Lagged(_)) => {}
+                                Err(RecvError::Closed) => break,
+                            }
+                        }
+                    }));
+                    let (mut resolved, e) = (queue.subscribe_resolved(), emit.clone());
+                    tasks.push(tokio::spawn(async move {
+                        use tokio::sync::broadcast::error::RecvError;
+                        loop {
+                            match resolved.recv().await {
+                                Ok(id) => e.send(Event::Resolved(id)),
+                                Err(RecvError::Lagged(_)) => {}
+                                Err(RecvError::Closed) => break,
                             }
                         }
                     }));
@@ -172,15 +214,23 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, emit: Emit, logged: Arc<AtomicBoo
             Cmd::Stop => {
                 if let Some(p) = proxy.take() {
                     p.shutdown().await;
-                    if let Some(f) = forwarder.take() {
-                        f.abort();
-                    }
+                    tasks.drain(..).for_each(|t| t.abort());
                 }
                 emit.send(Event::Stopped);
             }
             Cmd::SetScope(scope) => {
                 if let Some(p) = &proxy {
                     p.set_scope(scope);
+                }
+            }
+            Cmd::SetIntercept { dir, on } => {
+                if let Some(p) = &proxy {
+                    p.intercept().set_enabled(dir, on);
+                }
+            }
+            Cmd::Decide { id, decision } => {
+                if let Some(p) = &proxy {
+                    p.intercept().decide(id, decision);
                 }
             }
             Cmd::ExportCa { ca_dir, out, der } => match export_ca(ca_dir, out, der).await {

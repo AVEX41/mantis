@@ -9,7 +9,7 @@ the already-rewritten message.
 ## Intercept queue
 - `mantis-cli proxy --intercept` holds requests and `--intercept-responses` also holds responses.
   Each held message prints with control characters escaped; answer `f` (forward) or `d` (drop) on stdin.
-  If stdin closes, interception turns off so nothing stays stuck. Editing is for the GUI.
+  If stdin closes, interception turns off so nothing stays stuck. Editing is in the GUI (see `docs/UI.md`).
 - Library: `ProxyHandle::intercept()` gives `set_enabled(Dir, bool)`, `subscribe()` (a `Held` event
   per message), `pending()` and `decide(id, Forward | Edited(bytes) | Drop)`. Turning a direction off
   forwards everything held in it.

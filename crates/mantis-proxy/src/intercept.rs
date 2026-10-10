@@ -57,6 +57,7 @@ struct Inner {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     events: broadcast::Sender<Held>,
+    resolved: broadcast::Sender<u64>,
 }
 
 /// Handle to the intercept queue. Cheap to clone.
@@ -84,6 +85,7 @@ impl Drop for Guard<'_> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.id);
+        let _ = self.inner.resolved.send(self.id);
     }
 }
 
@@ -97,6 +99,7 @@ impl Intercept {
     /// A queue with interception off for both directions.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
+        let (resolved, _) = broadcast::channel(256);
         Intercept {
             inner: Arc::new(Inner {
                 request_on: AtomicBool::new(false),
@@ -104,6 +107,7 @@ impl Intercept {
                 next_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 events,
+                resolved,
             }),
         }
     }
@@ -139,6 +143,12 @@ impl Intercept {
     /// Receive each message as it is held.
     pub fn subscribe(&self) -> broadcast::Receiver<Held> {
         self.inner.events.subscribe()
+    }
+
+    /// Receive the id of each held message when it stops waiting, however that
+    /// happened: decided, released by turning interception off, or the client went away.
+    pub fn subscribe_resolved(&self) -> broadcast::Receiver<u64> {
+        self.inner.resolved.subscribe()
     }
 
     /// Messages currently waiting, oldest first.
