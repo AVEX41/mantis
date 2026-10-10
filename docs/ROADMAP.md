@@ -10,7 +10,7 @@ Each item is complete only when its acceptance criteria pass and fmt/clippy/test
 ## Phase 1 - Core and wire
 - [x] Message model (raw + derived view), SQLite storage with migrations.
 - [x] Raw HTTP/1.1 writer/reader. Acceptance: round-trip tests preserve malformed headers, duplicate headers, bare LF, obs-fold.
-- [ ] Scope model (include/exclude by host, port, path regex).
+- [x] Scope model (include/exclude by host, port, path regex).
 
 ## Phase 2 - Proxy
 - [ ] HTTP proxy on localhost, logging to SQLite.
