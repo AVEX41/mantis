@@ -18,8 +18,11 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use crate::intercept::{Decision, HoldOutcome, Intercept};
+use crate::rewrite::Rewriter;
 use crate::target::{connect_target, resolve, tunneled, Dest, Reject};
 use crate::tls::{self, Mitm};
+use crate::Dir;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -30,6 +33,8 @@ pub(crate) struct Ctx {
     pub log: mpsc::Sender<Exchange>,
     /// `None`: no CA configured, `CONNECT` is refused with 501.
     pub mitm: Option<Mitm>,
+    pub intercept: Intercept,
+    pub rewriter: Rewriter,
 }
 
 type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
@@ -172,6 +177,16 @@ fn closes(raw: &[u8], headers: &[Header], version: Option<&std::ops::Range<usize
             && !has_token(raw, headers, b"connection", b"keep-alive"))
 }
 
+/// What to store about one exchange.
+struct Record {
+    ts: i64,
+    request: Bytes,
+    request_original: Option<Bytes>,
+    response: Option<Bytes>,
+    response_original: Option<Bytes>,
+    dropped: bool,
+}
+
 impl Ctx {
     fn loggable(&self, d: &Dest) -> bool {
         self.scope.as_ref().is_none_or(|s| {
@@ -195,18 +210,21 @@ impl Ctx {
                     .is_ok_and(|ip| ip.is_loopback() || ip == self.listen.ip()))
     }
 
-    async fn log(&self, d: &Dest, tls: bool, ts: i64, request: Bytes, response: Option<Bytes>) {
+    async fn log(&self, d: &Dest, tls: bool, rec: Record) {
         if !self.loggable(d) {
             return;
         }
         let ex = Exchange {
-            ts_micros: ts,
+            ts_micros: rec.ts,
             source: Source::Proxy,
             host: d.host.clone(),
             port: d.port,
             tls,
-            request,
-            response,
+            request: rec.request,
+            response: rec.response,
+            request_original: rec.request_original,
+            response_original: rec.response_original,
+            dropped: rec.dropped,
         };
         if self.log.send(ex).await.is_err() {
             tracing::error!("store writer is gone; exchange not logged");
@@ -284,12 +302,49 @@ where
         let method = view.method.as_ref().map(|r| msg.raw[r.clone()].to_vec());
         let close_req = closes(&msg.raw, &view.headers, view.version.as_ref());
 
+        // Rewrite rules, then the intercept queue. Both leave out-of-scope
+        // traffic alone: it is forwarded untouched and unlogged.
+        let in_scope = ctx.loggable(&dest);
+        let mut request = msg.raw.clone();
+        if in_scope {
+            let rw = ctx.rewriter.apply(Dir::Request, &request);
+            rw.warnings
+                .iter()
+                .for_each(|w| tracing::warn!(warning = %w, "request rewrite"));
+            request = rw.raw;
+        }
+        if in_scope && ctx.intercept.is_enabled(Dir::Request) {
+            match ctx
+                .intercept
+                .hold(client, Dir::Request, &dest.host, dest.port, tls, &request)
+                .await
+            {
+                HoldOutcome::ClientGone => return Ok(Outcome::Done),
+                HoldOutcome::Decided(Decision::Forward) => {}
+                HoldOutcome::Decided(Decision::Edited(b)) => request = b,
+                HoldOutcome::Decided(Decision::Drop) => {
+                    let request_original = (request != msg.raw).then(|| msg.raw.clone());
+                    let rec = Record {
+                        ts,
+                        request,
+                        request_original,
+                        response: None,
+                        response_original: None,
+                        dropped: true,
+                    };
+                    ctx.log(&dest, tls, rec).await;
+                    return Ok(Outcome::Done);
+                }
+            }
+        }
+        let request_original = (request != msg.raw).then(|| msg.raw.clone());
+
         let resp = match obtain_response(
             ctx,
             &mut upstream,
             &dest,
             tls,
-            &msg.raw,
+            &request,
             method.as_deref(),
             cw,
         )
@@ -298,15 +353,57 @@ where
             Ok(r) => r,
             Err(why) => {
                 tracing::warn!(host = %dest.host, port = dest.port, %why, "upstream failed");
-                ctx.log(&dest, tls, ts, msg.raw.clone(), None).await;
+                let rec = Record {
+                    ts,
+                    request,
+                    request_original,
+                    response: None,
+                    response_original: None,
+                    dropped: false,
+                };
+                ctx.log(&dest, tls, rec).await;
                 write_raw(cw, &reply("502 Bad Gateway", &format!("{why}\n"))).await?;
                 return Ok(Outcome::Done);
             }
         };
-        write_raw(cw, &resp.raw).await?;
-        ctx.log(&dest, tls, ts, msg.raw.clone(), Some(resp.raw.clone()))
-            .await;
-        tracing::info!(host = %dest.host, port = dest.port, tls, bytes = resp.raw.len(), "exchange");
+
+        let mut response = resp.raw.clone();
+        if in_scope {
+            let rw = ctx.rewriter.apply(Dir::Response, &response);
+            rw.warnings
+                .iter()
+                .for_each(|w| tracing::warn!(warning = %w, "response rewrite"));
+            response = rw.raw;
+        }
+        let mut dropped = false;
+        if in_scope && ctx.intercept.is_enabled(Dir::Response) {
+            match ctx
+                .intercept
+                .hold(client, Dir::Response, &dest.host, dest.port, tls, &response)
+                .await
+            {
+                HoldOutcome::ClientGone => return Ok(Outcome::Done),
+                HoldOutcome::Decided(Decision::Forward) => {}
+                HoldOutcome::Decided(Decision::Edited(b)) => response = b,
+                HoldOutcome::Decided(Decision::Drop) => dropped = true,
+            }
+        }
+        let response_original = (response != resp.raw).then(|| resp.raw.clone());
+        let rec = Record {
+            ts,
+            request,
+            request_original,
+            response: Some(response.clone()),
+            response_original,
+            dropped,
+        };
+        if dropped {
+            ctx.log(&dest, tls, rec).await;
+            return Ok(Outcome::Done);
+        }
+        write_raw(cw, &response).await?;
+        ctx.log(&dest, tls, rec).await;
+        tracing::info!(host = %dest.host, port = dest.port, tls, bytes = response.len(), "exchange");
 
         if resp.framing == Framing::HeadOnly {
             if let Some(up) = upstream.take() {

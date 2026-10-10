@@ -9,7 +9,10 @@ use crate::message::{Exchange, Source, Stored, Summary};
 use crate::view::{RequestView, ResponseView};
 
 /// Migrations in order; entry `i` upgrades `user_version` from `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_originals.sql"),
+];
 const LATEST: u32 = MIGRATIONS.len() as u32;
 
 /// Storage errors.
@@ -67,8 +70,9 @@ impl Store {
             .as_ref()
             .and_then(|r| ResponseView::parse(r).status);
         self.conn.execute(
-            "INSERT INTO exchanges (ts, source, host, port, tls, method, path, status, request, response)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO exchanges (ts, source, host, port, tls, method, path, status, request, response,
+                                    request_original, response_original, dropped)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 ex.ts_micros,
                 ex.source.as_str(),
@@ -79,7 +83,10 @@ impl Store {
                 path,
                 status,
                 &ex.request[..],
-                ex.response.as_deref()
+                ex.response.as_deref(),
+                ex.request_original.as_deref(),
+                ex.response_original.as_deref(),
+                ex.dropped
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -103,7 +110,8 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, ts, source, host, port, tls, request, response FROM exchanges WHERE id = ?1",
+                "SELECT id, ts, source, host, port, tls, request, response, request_original, response_original, dropped
+                 FROM exchanges WHERE id = ?1",
                 [id],
                 |r| {
                     Ok((
@@ -115,24 +123,44 @@ impl Store {
                         r.get::<_, bool>(5)?,
                         r.get::<_, Vec<u8>>(6)?,
                         r.get::<_, Option<Vec<u8>>>(7)?,
+                        r.get::<_, Option<Vec<u8>>>(8)?,
+                        r.get::<_, Option<Vec<u8>>>(9)?,
+                        r.get::<_, bool>(10)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(id, ts, source, host, port, tls, request, response)| {
-            Ok(Stored {
+        row.map(
+            |(
                 id,
-                exchange: Exchange {
-                    ts_micros: ts,
-                    source: Source::parse(&source).ok_or(StoreError::Corrupt("source"))?,
-                    host,
-                    port: u16::try_from(port).map_err(|_| StoreError::Corrupt("port"))?,
-                    tls,
-                    request: request.into(),
-                    response: response.map(Bytes::from),
-                },
-            })
-        })
+                ts,
+                source,
+                host,
+                port,
+                tls,
+                request,
+                response,
+                request_original,
+                response_original,
+                dropped,
+            )| {
+                Ok(Stored {
+                    id,
+                    exchange: Exchange {
+                        ts_micros: ts,
+                        source: Source::parse(&source).ok_or(StoreError::Corrupt("source"))?,
+                        host,
+                        port: u16::try_from(port).map_err(|_| StoreError::Corrupt("port"))?,
+                        tls,
+                        request: request.into(),
+                        response: response.map(Bytes::from),
+                        request_original: request_original.map(Bytes::from),
+                        response_original: response_original.map(Bytes::from),
+                        dropped,
+                    },
+                })
+            },
+        )
         .transpose()
     }
 
@@ -140,7 +168,9 @@ impl Store {
     pub fn summary(&self, id: i64) -> Result<Option<Summary>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, ts, source, host, port, tls, method, path, status FROM exchanges WHERE id = ?1",
+                "SELECT id, ts, source, host, port, tls, method, path, status, dropped,
+                        (request_original IS NOT NULL OR response_original IS NOT NULL)
+                 FROM exchanges WHERE id = ?1",
                 [id],
                 summary_row,
             )
@@ -151,7 +181,8 @@ impl Store {
     /// List summaries, newest first.
     pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<Summary>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, source, host, port, tls, method, path, status
+            "SELECT id, ts, source, host, port, tls, method, path, status, dropped,
+                    (request_original IS NOT NULL OR response_original IS NOT NULL)
              FROM exchanges ORDER BY id DESC LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt.query_map(params![limit as i64, offset as i64], summary_row)?;
@@ -177,6 +208,8 @@ fn summary_row(r: &Row<'_>) -> rusqlite::Result<Result<Summary, StoreError>> {
                 .map(u16::try_from)
                 .transpose()
                 .map_err(|_| StoreError::Corrupt("status"))?,
+            dropped: r.get(9)?,
+            modified: r.get(10)?,
         })
     })())
 }
@@ -216,6 +249,9 @@ mod tests {
             tls: true,
             request: Bytes::copy_from_slice(request),
             response: response.map(Bytes::copy_from_slice),
+            request_original: None,
+            response_original: None,
+            dropped: false,
         }
     }
 
@@ -228,6 +264,47 @@ mod tests {
         let got = s.get(id).unwrap().unwrap();
         assert_eq!(got.exchange, ex(rq, Some(rs)));
         assert!(s.get(id + 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn originals_and_dropped_round_trip_and_show_in_summaries() {
+        let s = Store::in_memory().unwrap();
+        let mut e = ex(b"GET /new HTTP/1.1\r\n\r\n", None);
+        e.request_original = Some(Bytes::from_static(b"GET /old HTTP/1.1\r\n\r\n"));
+        e.dropped = true;
+        let id = s.insert(&e).unwrap();
+        assert_eq!(s.get(id).unwrap().unwrap().exchange, e);
+        let sum = s.summary(id).unwrap().unwrap();
+        assert!(sum.modified && sum.dropped);
+        let plain = s.insert(&ex(b"GET / HTTP/1.1\r\n\r\n", None)).unwrap();
+        let sum = s.summary(plain).unwrap().unwrap();
+        assert!(!sum.modified && !sum.dropped);
+    }
+
+    #[test]
+    fn upgrades_a_version_1_database_in_place() {
+        let path = std::env::temp_dir().join(format!("mantis-v1-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.pragma_update(None, "user_version", 1u32).unwrap();
+            c.execute(
+                "INSERT INTO exchanges (ts, source, host, port, tls, request) VALUES (1, 'proxy', 'h', 80, 0, x'474554')",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let got = s.get(1).unwrap().unwrap().exchange;
+        assert_eq!(
+            (&got.request[..], got.request_original, got.dropped),
+            (&b"GET"[..], None, false)
+        );
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     #[test]

@@ -6,6 +6,8 @@
 
 pub mod ca;
 mod conn;
+pub mod intercept;
+pub mod rewrite;
 mod target;
 mod tls;
 
@@ -17,6 +19,15 @@ use mantis_core::{Exchange, Scope, Store, Summary};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+
+/// Direction of a message through the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    /// Client to origin.
+    Request,
+    /// Origin to client.
+    Response,
+}
 
 /// Proxy settings.
 #[derive(Debug, Clone)]
@@ -36,6 +47,8 @@ pub struct Config {
     /// targets with self-signed certificates. Frontends must expose this
     /// same option and make its state obvious.
     pub insecure_upstream: bool,
+    /// Match-and-replace rules applied to forwarded messages.
+    pub rewrite: Vec<rewrite::RuleSpec>,
     /// Extra trusted roots for origin certificates, in addition to the OS store.
     pub extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
@@ -49,6 +62,7 @@ impl Default for Config {
             limits: Limits::default(),
             ca: None,
             insecure_upstream: false,
+            rewrite: Vec::new(),
             extra_upstream_roots: Vec::new(),
         }
     }
@@ -60,6 +74,9 @@ pub enum ProxyError {
     /// Binding or socket setup failed.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
+    /// A rewrite rule is invalid.
+    #[error("rewrite rules: {0}")]
+    Rewrite(#[from] rewrite::RewriteError),
     /// TLS setup failed.
     #[error("tls: {0}")]
     Tls(#[from] rustls::Error),
@@ -75,12 +92,24 @@ pub struct ProxyHandle {
     stop: oneshot::Sender<()>,
     accept: JoinHandle<()>,
     writer: std::thread::JoinHandle<()>,
+    intercept: intercept::Intercept,
+    rewriter: rewrite::Rewriter,
 }
 
 impl ProxyHandle {
     /// The address actually bound (useful with port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The intercept queue (off until enabled).
+    pub fn intercept(&self) -> intercept::Intercept {
+        self.intercept.clone()
+    }
+
+    /// The match-and-replace rules; they can be replaced while running.
+    pub fn rewriter(&self) -> rewrite::Rewriter {
+        self.rewriter.clone()
     }
 
     /// Receive a [`Summary`] for each exchange as it is stored.
@@ -105,6 +134,8 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
     }
     let listener = TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
+    let rewriter = rewrite::Rewriter::new(config.rewrite)?;
+    let intercept = intercept::Intercept::new();
     let mitm = match &config.ca {
         Some(ca) => Some(tls::Mitm {
             certs: Arc::new(tls::CertCache::new(ca.clone())),
@@ -126,6 +157,8 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         limits: config.limits,
         log: log_tx,
         mitm,
+        intercept: intercept.clone(),
+        rewriter: rewriter.clone(),
     });
     let (stop, mut stopped) = oneshot::channel();
     let accept = tokio::spawn(async move {
@@ -157,6 +190,8 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         stop,
         accept,
         writer,
+        intercept,
+        rewriter,
     })
 }
 

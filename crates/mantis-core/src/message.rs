@@ -55,6 +55,13 @@ pub struct Exchange {
     pub request: Bytes,
     /// Raw response bytes, if one was received.
     pub response: Option<Bytes>,
+    /// The request as captured, when rewrite rules or an edit changed what
+    /// was sent (`request` then holds the bytes actually sent).
+    pub request_original: Option<Bytes>,
+    /// The response as received, when it was changed before reaching the client.
+    pub response_original: Option<Bytes>,
+    /// The user dropped the request or response from the intercept queue.
+    pub dropped: bool,
 }
 
 /// An [`Exchange`] with its storage id.
@@ -87,6 +94,10 @@ pub struct Summary {
     pub path: Option<String>,
     /// Response status code, if the response had a parseable one.
     pub status: Option<u16>,
+    /// Rewrite rules or an edit changed the request or response.
+    pub modified: bool,
+    /// The user dropped the exchange from the intercept queue.
+    pub dropped: bool,
 }
 
 /// Current time as unix microseconds (0 if the clock is before the epoch).

@@ -8,7 +8,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use mantis_core::{Scope, Store};
 use mantis_proxy::ca::Ca;
+use mantis_proxy::intercept::Decision;
+use mantis_proxy::{rewrite, Dir};
 use mantis_proxy::{serve, Config};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(version, about = "Mantis security-testing toolkit")]
@@ -36,6 +39,15 @@ enum Cmd {
         /// Directory holding the local CA (default: the user data directory).
         #[arg(long)]
         ca_dir: Option<PathBuf>,
+        /// TOML file of match-and-replace rules (`[[rules]]` tables).
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// Hold each in-scope request and ask on stdin: f = forward, d = drop.
+        #[arg(long)]
+        intercept: bool,
+        /// Also hold responses.
+        #[arg(long)]
+        intercept_responses: bool,
         /// DANGEROUS: do not verify origin server certificates. For lab targets with self-signed certificates only.
         #[arg(long)]
         insecure_upstream: bool,
@@ -121,8 +133,20 @@ async fn main() -> anyhow::Result<()> {
             scope,
             allow_non_loopback,
             ca_dir: dir,
+            rules,
+            intercept,
+            intercept_responses,
             insecure_upstream,
         } => {
+            let rewrite = match rules {
+                Some(p) => {
+                    let text = std::fs::read_to_string(&p)
+                        .with_context(|| format!("reading {}", p.display()))?;
+                    rewrite::parse_rules(&text)
+                        .with_context(|| format!("parsing {}", p.display()))?
+                }
+                None => Vec::new(),
+            };
             let scope = scope
                 .map(|p| {
                     let text = std::fs::read_to_string(&p)
@@ -148,9 +172,16 @@ async fn main() -> anyhow::Result<()> {
                 scope,
                 ca: Some(Arc::new(ca)),
                 insecure_upstream,
+                rewrite,
                 ..Config::default()
             };
             let proxy = serve(config, store).await?;
+            let queue = proxy.intercept();
+            queue.set_enabled(Dir::Request, intercept);
+            queue.set_enabled(Dir::Response, intercept_responses);
+            if intercept || intercept_responses {
+                tokio::spawn(prompt(queue));
+            }
             let mut events = proxy.subscribe();
             tracing::info!(db = %db.display(), "logging to database; Ctrl-C to stop");
             loop {
@@ -170,5 +201,67 @@ async fn main() -> anyhow::Result<()> {
             proxy.shutdown().await;
             Ok(())
         }
+    }
+}
+
+/// Show raw bytes safely: control characters and non-ASCII bytes are escaped so
+/// captured traffic cannot drive the terminal.
+fn printable(raw: &[u8]) -> String {
+    raw.iter()
+        .take(4000)
+        .map(|&b| match b {
+            b'\n' | b'\t' | 0x20..=0x7e => (b as char).to_string(),
+            b'\r' => "\\r".to_string(),
+            _ => format!("\\x{b:02x}"),
+        })
+        .collect()
+}
+
+/// Ask on stdin what to do with each held message. If stdin closes,
+/// interception is turned off so nothing stays stuck.
+async fn prompt(queue: mantis_proxy::intercept::Intercept) {
+    let mut held = queue.subscribe();
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let h = match held.recv().await {
+            Ok(h) => h,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => return,
+        };
+        println!(
+            "--- held {:?} #{} {}:{} ---\n{}",
+            h.dir,
+            h.id,
+            h.host,
+            h.port,
+            printable(&h.raw)
+        );
+        let decision = loop {
+            print!("[f]orward / [d]rop? ");
+            let _ = tokio::io::stdout().flush().await;
+            match lines.next_line().await {
+                Ok(Some(l)) if l.trim().eq_ignore_ascii_case("f") => break Decision::Forward,
+                Ok(Some(l)) if l.trim().eq_ignore_ascii_case("d") => break Decision::Drop,
+                Ok(Some(_)) => {}
+                _ => {
+                    queue.set_enabled(Dir::Request, false);
+                    queue.set_enabled(Dir::Response, false);
+                    return;
+                }
+            }
+        };
+        queue.decide(h.id, decision);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::printable;
+
+    #[test]
+    fn terminal_escapes_in_captured_traffic_are_neutralised() {
+        let shown = printable(b"GET / HTTP/1.1\r\nX: \x1b]0;pwned\x07\xff\r\n\r\n");
+        assert!(!shown.contains('\x1b') && !shown.contains('\x07'));
+        assert!(shown.contains("\\x1b") && shown.contains("\\xff") && shown.contains("\\r"));
     }
 }

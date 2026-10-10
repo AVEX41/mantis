@@ -11,7 +11,7 @@ mod write;
 #[cfg(test)]
 mod tests;
 
-pub use read::{Framing, Kind, Limits, Message, Reader};
+pub use read::{detect_framing, Framing, Kind, Limits, Message, Reader};
 pub use write::write_raw;
 
 /// Errors from the wire reader.

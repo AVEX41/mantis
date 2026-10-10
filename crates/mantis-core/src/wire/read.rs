@@ -88,6 +88,17 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         }
     }
 
+    /// Number of bytes read from the stream but not yet consumed.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Read more from the stream into the buffer without consuming a message
+    /// (cancel-safe). Returns 0 at end of stream.
+    pub async fn fill_more(&mut self) -> std::io::Result<usize> {
+        self.fill().await
+    }
+
     /// Take the bytes read from the stream but not yet consumed by a message.
     pub fn take_buffered(&mut self) -> BytesMut {
         self.buf.split()
@@ -120,7 +131,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         let Some(head_end) = self.read_head().await? else {
             return Ok(None);
         };
-        let (framing, ambiguous) = decide(&self.buf[..head_end], kind);
+        let (framing, ambiguous) = detect_framing(&self.buf[..head_end], kind);
         let max_body = self.limits.max_body;
         let total = match framing {
             Framing::None | Framing::HeadOnly => head_end,
@@ -288,8 +299,9 @@ fn parse_len(v: &[u8]) -> Option<u64> {
     std::str::from_utf8(v).ok()?.parse().ok()
 }
 
-/// Decide framing from a complete head. Returns (framing, ambiguous).
-fn decide(head: &[u8], kind: Kind<'_>) -> (Framing, bool) {
+/// Decide how a message with this head ends. Returns (framing, ambiguous).
+/// `head` may extend past the blank line; only the headers are read.
+pub fn detect_framing(head: &[u8], kind: Kind<'_>) -> (Framing, bool) {
     let (headers, status) = match kind {
         Kind::Request => (RequestView::parse(head).headers, None),
         Kind::Response { .. } => {

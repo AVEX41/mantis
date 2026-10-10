@@ -522,3 +522,48 @@ async fn connect_to_the_proxy_itself_is_refused() {
     assert!(buf.starts_with(b"HTTP/1.1 400 "));
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn the_intercept_queue_works_inside_an_intercepted_tunnel() {
+    use bytes::Bytes;
+    use mantis_proxy::intercept::Decision;
+    use mantis_proxy::Dir;
+
+    let origin = TlsOrigin::start("127.0.0.1", &[OK5]).await;
+    let mut rig = Rig::start(Opts {
+        scope: None,
+        trust_origin: Some(origin.ca_der.clone()),
+        insecure: false,
+    })
+    .await;
+    let intercept = rig.proxy.intercept();
+    let mut held_rx = intercept.subscribe();
+    intercept.set_enabled(Dir::Request, true);
+    let target = origin.addr.to_string();
+    let mut t = open_tunnel(rig.proxy.local_addr(), &target, "127.0.0.1", &rig.ca_der)
+        .await
+        .unwrap();
+    let original = get("/before", &target);
+    let sent = original.clone();
+    let client = tokio::spawn(async move { ask(&mut t, &sent).await });
+
+    let held = tokio::time::timeout(T, held_rx.recv())
+        .await
+        .expect("nothing held")
+        .unwrap();
+    assert!(held.tls);
+    assert_eq!(&held.raw[..], &original[..]);
+    assert!(origin.requests().is_empty());
+    let edited = Bytes::from(get("/after", &target));
+    intercept.decide(held.id, Decision::Edited(edited.clone()));
+
+    assert_eq!(tokio::time::timeout(T, client).await.unwrap().unwrap(), OK5);
+    assert_eq!(origin.requests(), vec![edited.to_vec()]);
+    let ev = rig.next_event().await;
+    let row = rig.store().get(ev.id).unwrap().unwrap().exchange;
+    assert_eq!(
+        (row.tls, &row.request[..], row.request_original.as_deref()),
+        (true, &edited[..], Some(&original[..]))
+    );
+    rig.finish().await;
+}

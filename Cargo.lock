@@ -612,14 +612,18 @@ dependencies = [
  "dirs",
  "lru",
  "mantis-core",
+ "proptest",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-native-certs",
+ "serde",
  "sha2",
  "thiserror",
  "time",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tracing",
 ]
 
