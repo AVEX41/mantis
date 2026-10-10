@@ -10,6 +10,16 @@ No Electron, no webview. Targets Windows, Linux, macOS.
 - Modern native GUI, plus a headless CLI that shares the same core.
 - No AI features.
 
+## Status
+Implemented: raw HTTP/1.1 wire layer, SQLite store, scope, HTTP/HTTPS/WebSocket proxy with local CA,
+intercept queue, match-and-replace, CLI, and a desktop UI (history, viewer, proxy, scope, intercept).
+Planned crates below are still empty. See docs/ROADMAP.md.
+
+Get started with docs/USAGE.md.
+
+## Responsible use
+This tool sends attack traffic. Use it only against systems you own or are authorised in writing to test.
+
 ## Repo layout (target)
 ```
 mantis/
@@ -31,6 +41,7 @@ mantis/
 ```
 
 ## Docs index
+- docs/USAGE.md - build, CLI reference, scope file, project database
 - docs/PRD.md - requirements and non-goals
 - docs/ARCHITECTURE.md - crates, data flow, key decisions
 - docs/ROADMAP.md - phases with acceptance criteria
@@ -38,3 +49,8 @@ mantis/
 - docs/TESTING.md - test strategy and lab targets
 - docs/CLAUDE_CODE_SETUP.md - how to start working with Claude Code
 - docs/PROMPTS.md - ready-to-paste prompts for each phase
+- docs/HTTPS_INTERCEPTION.md - CA setup, key handling, limits
+- docs/INTERCEPT_AND_REWRITE.md - intercept queue and match-and-replace rules
+- docs/WEBSOCKET.md - WebSocket frame capture
+- docs/UI.md - desktop UI guide and benchmark
+- docs/adr/ - architecture decision records (0001 GUI framework, 0002 HTTP/2 downgrade)
