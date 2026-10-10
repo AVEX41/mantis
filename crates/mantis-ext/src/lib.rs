@@ -1,0 +1,1 @@
+//! mantis-ext (empty skeleton).

@@ -1,0 +1,1 @@
+//! mantis-fuzz (empty skeleton).

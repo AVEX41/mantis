@@ -1,0 +1,1 @@
+//! mantis-core (empty skeleton).

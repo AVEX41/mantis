@@ -1,0 +1,1 @@
+//! mantis-entropy (empty skeleton).

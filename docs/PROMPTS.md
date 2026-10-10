@@ -14,6 +14,7 @@ and propose the exact Cargo workspace layout and dependency list for Phase 0.
 Implement the Phase 0 workspace item only: Cargo workspace with the crates in docs/ARCHITECTURE.md as empty
 libraries/binaries, rust-toolchain.toml, .gitignore (include CA keys, *.mantis, *.db), and a GitHub Actions
 matrix for Windows/Linux/macOS running fmt, clippy, test. Verify with the commands in CLAUDE.md.
+Do not commit; give me the commit message and git add command.
 ```
 
 ## Phase 0: GUI spike
@@ -41,3 +42,4 @@ Then stop and report before starting TLS interception.
 Use the code-reviewer subagent on the diff. Then check the acceptance criteria in docs/ROADMAP.md
 for this item and report pass/fail per criterion.
 ```
+Then run `/commit-msg`. Claude prints the message and `git add` command; you commit yourself.

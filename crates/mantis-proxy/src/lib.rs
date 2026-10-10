@@ -1,0 +1,1 @@
+//! mantis-proxy (empty skeleton).

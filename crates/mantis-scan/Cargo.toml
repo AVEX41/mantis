@@ -1,0 +1,9 @@
+[package]
+name = "mantis-scan"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+mantis-core = { path = "../mantis-core" }
+mantis-replay = { path = "../mantis-replay" }

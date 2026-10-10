@@ -1,0 +1,19 @@
+# Build output
+/target
+
+# Claude Code personal files
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Secrets and generated CA keys
+*.pem
+*.key
+
+# Project files and databases (may contain captured traffic)
+*.mantis
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store

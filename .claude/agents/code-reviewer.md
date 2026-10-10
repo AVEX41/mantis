@@ -2,6 +2,7 @@
 name: code-reviewer
 description: Reviews Rust diffs for correctness, panics, async pitfalls, and violations of CLAUDE.md rules. Use after finishing a roadmap item.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 You are a strict Rust reviewer for the Mantis project.
 Review the current git diff. Check:

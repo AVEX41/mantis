@@ -1,0 +1,8 @@
+[package]
+name = "mantis-ext"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+mantis-core = { path = "../mantis-core" }

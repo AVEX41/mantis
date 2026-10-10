@@ -1,0 +1,1 @@
+//! mantis-scan (empty skeleton).
