@@ -24,7 +24,7 @@ client -> proxy listener -> TLS terminate -> parse (derive view, keep raw) -> in
 3. rustls + rcgen; per-host leaf cert cache.
 4. SQLite with blob bodies; indexes on host, method, status, time.
 5. Event bus: tokio broadcast for history events, mpsc for commands.
-6. GUI framework is chosen after the editor-widget spike (see ROADMAP phase 0). Candidates: iced, Slint, egui.
+6. GUI framework: egui/eframe (ADR 0001).
 7. Browser integration is an external Chromium process controlled via DevTools Protocol.
 8. Extensions: WASM via wasmtime with capability-limited host API.
 9. Scan checks are modules behind one trait; a declarative template format is a later option.

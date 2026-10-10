@@ -3,16 +3,15 @@
 Native Rust security-testing toolkit (intercepting proxy, replay, fuzzer, scanner, OOB server).
 No webview, no Electron, no AI features. Never reference other commercial products in code, docs, or commits.
 
-Status: pre-code (Phase 0). There's no Cargo workspace yet. The target crate layout is in README.md and
-docs/ARCHITECTURE.md; follow it rather than inventing one. The commands below apply once the workspace exists.
+Status: Phase 0. The Cargo workspace exists with empty crates. The crate layout is in README.md and
+docs/ARCHITECTURE.md; follow it rather than inventing one.
 
 ## Commands
 - Build: `cargo build --workspace`
 - Test: `cargo test --workspace`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Run CLI: `cargo run -p mantis-cli -- --help`
-- Run UI: `cargo run -p mantis-ui` (GUI framework not chosen yet: the iced/Slint/egui spike is ARCHITECTURE
-  decision 6. Don't pick one on your own.)
+- Run UI: `cargo run -p mantis-ui` (GUI framework: egui/eframe, per docs/adr/0001-gui-framework.md.)
 - Fuzz: `cargo fuzz run <target>` (cargo-fuzz; targets go in `fuzz/`)
 - Definition of done: fmt, clippy, and tests all pass.
 

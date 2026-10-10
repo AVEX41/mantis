@@ -17,3 +17,4 @@ CLAUDE.local.md
 
 # OS
 .DS_Store
+/spikes/*/target

@@ -1,0 +1,32 @@
+import { ListView, LineEdit, Button } from "std-widgets.slint";
+
+export component App inherits Window {
+    in property <[string]> rows;
+    in-out property <length> vy;
+    in property <string> matches;
+    callback query(string);
+    callback next();
+    callback hex(bool);
+    preferred-width: 1024px;
+    preferred-height: 768px;
+    VerticalLayout {
+        HorizontalLayout {
+            spacing: 8px;
+            Button { text: "Text"; clicked => { root.hex(false); } }
+            Button { text: "Hex"; clicked => { root.hex(true); } }
+            LineEdit { placeholder-text: "search"; edited(t) => { root.query(t); } }
+            Button { text: "Next"; clicked => { root.next(); } }
+            Text { text: root.matches; vertical-alignment: center; }
+        }
+        ListView {
+            content-y <=> root.vy;
+            for r in root.rows: Text {
+                text: r;
+                font-family: "Menlo";
+                font-size: 13px;
+                height: 16px;
+                wrap: no-wrap;
+            }
+        }
+    }
+}

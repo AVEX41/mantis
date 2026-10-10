@@ -6,3 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bytes = "1.12.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
+tokio = { version = "1.53.2", features = ["rt", "macros"] }

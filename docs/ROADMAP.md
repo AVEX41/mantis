@@ -3,13 +3,13 @@
 Each item is complete only when its acceptance criteria pass and fmt/clippy/tests are green.
 
 ## Phase 0 - Foundations and spikes
-- [ ] Workspace, CI (Windows/Linux/macOS matrix), rust-toolchain.toml, LICENSE choice.
-- [ ] GUI spike: one window with a 5 MB text body viewer, hex view, search, in iced, Slint, and egui.
+- [x] Workspace, CI (Windows/Linux/macOS matrix), rust-toolchain.toml, LICENSE choice.
+- [x] GUI spike: one window with a 5 MB text body viewer, hex view, search, in iced, Slint, and egui.
   Acceptance: scroll stays smooth; non-UTF-8 bytes render; decision recorded as ADR.
 
 ## Phase 1 - Core and wire
-- [ ] Message model (raw + derived view), SQLite storage with migrations.
-- [ ] Raw HTTP/1.1 writer/reader. Acceptance: round-trip tests preserve malformed headers, duplicate headers, bare LF, obs-fold.
+- [x] Message model (raw + derived view), SQLite storage with migrations.
+- [x] Raw HTTP/1.1 writer/reader. Acceptance: round-trip tests preserve malformed headers, duplicate headers, bare LF, obs-fold.
 - [ ] Scope model (include/exclude by host, port, path regex).
 
 ## Phase 2 - Proxy
