@@ -16,7 +16,7 @@ Each item is complete only when its acceptance criteria pass and fmt/clippy/test
 - [x] HTTP proxy on localhost, logging to SQLite.
 - [ ] CA generation, export, per-host leaf certs, HTTPS interception. Acceptance: browser with CA loads an HTTPS site through the proxy.
 - [x] Intercept queue (forward/drop/edit) and match-and-replace.
-- [ ] WebSocket capture. HTTP/2 support or documented downgrade.
+- [x] WebSocket capture. HTTP/2 support or documented downgrade.
 
 ## Phase 3 - Minimal GUI
 - [ ] History table (virtualized), message viewer/editor, intercept panel, scope settings.

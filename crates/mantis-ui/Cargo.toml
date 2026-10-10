@@ -13,3 +13,12 @@ mantis-fuzz = { path = "../mantis-fuzz" }
 mantis-entropy = { path = "../mantis-entropy" }
 mantis-scan = { path = "../mantis-scan" }
 mantis-ext = { path = "../mantis-ext" }
+eframe = "0.36"
+egui_extras = "0.36"
+memchr = "2.8.3"
+thiserror = "2.0.21"
+bytes = "1.12.1"
+anyhow = "1.0.104"
+
+[dev-dependencies]
+proptest = "1.11.0"

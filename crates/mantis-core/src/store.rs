@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use bytes::Bytes;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::message::{Exchange, Source, Stored, StoredWsFrame, Summary, WsDir, WsFrame};
 use crate::view::{RequestView, ResponseView};
@@ -33,10 +33,50 @@ pub enum StoreError {
     /// No exchange has this id.
     #[error("no exchange with id {0}")]
     NotFound(i64),
+    /// The database predates this build and must be opened read-write once to migrate it.
+    #[error("database schema version {found} needs migrating to {latest}")]
+    NeedsMigration {
+        /// Version found in the file.
+        found: u32,
+        /// Version this build expects.
+        latest: u32,
+    },
     /// A stored value could not be decoded.
     #[error("corrupt row: {0}")]
     Corrupt(&'static str),
 }
+
+/// Which rows to list or count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Case-insensitive substring matched against host, method, path and status.
+    /// Empty matches everything.
+    pub text: String,
+}
+
+impl Filter {
+    /// The `LIKE` pattern for this filter, or `None` to match every row.
+    fn pattern(&self) -> Option<String> {
+        let t = self.text.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let esc: String = t
+            .chars()
+            .flat_map(|c| {
+                if matches!(c, '%' | '_' | '\\') {
+                    vec!['\\', c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        Some(format!("%{esc}%"))
+    }
+}
+
+const WHERE_FILTER: &str = "(?1 IS NULL OR host LIKE ?1 ESCAPE '\\' OR method LIKE ?1 ESCAPE '\\' \
+     OR path LIKE ?1 ESCAPE '\\' OR CAST(status AS TEXT) LIKE ?1 ESCAPE '\\')";
 
 /// Handle to an exchange database.
 pub struct Store {
@@ -49,6 +89,26 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::init(conn)
+    }
+
+    /// Open an existing, already migrated database for reading only.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let found: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match found.cmp(&LATEST) {
+            std::cmp::Ordering::Greater => Err(StoreError::NewerSchema {
+                found,
+                supported: LATEST,
+            }),
+            std::cmp::Ordering::Less => Err(StoreError::NeedsMigration {
+                found,
+                latest: LATEST,
+            }),
+            std::cmp::Ordering::Equal => Ok(Store { conn }),
+        }
     }
 
     /// Open a private in-memory database (for tests and ephemeral sessions).
@@ -228,6 +288,44 @@ impl Store {
             .transpose()
     }
 
+    /// Insert many exchanges in one transaction (much faster than one by one).
+    pub fn insert_batch(&self, exchanges: &[Exchange]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for ex in exchanges {
+            self.insert(ex)?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Number of rows matching `filter`.
+    pub fn count(&self, filter: &Filter) -> Result<usize, StoreError> {
+        let sql = format!("SELECT COUNT(*) FROM exchanges WHERE {WHERE_FILTER}");
+        let n: i64 = self
+            .conn
+            .query_row(&sql, [filter.pattern()], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Summaries matching `filter` in ascending id order, `limit` rows from `offset`.
+    pub fn list_range(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: &Filter,
+    ) -> Result<Vec<Summary>, StoreError> {
+        let sql = format!(
+            "SELECT id, ts, source, host, port, tls, method, path, status, dropped,
+                    (request_original IS NOT NULL OR response_original IS NOT NULL)
+             FROM exchanges WHERE {WHERE_FILTER} ORDER BY id LIMIT ?2 OFFSET ?3"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![filter.pattern(), limit as i64, offset as i64],
+            summary_row,
+        )?;
+        rows.map(|r| r?).collect()
+    }
+
     /// List summaries, newest first.
     pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<Summary>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -390,6 +488,117 @@ mod tests {
         assert_eq!(got, vec![f1, f2]);
         assert_eq!(s.ws_frames(b).unwrap().len(), 1);
         assert!(s.ws_frames(999).unwrap().is_empty());
+    }
+
+    fn host_ex(host: &str, request: &[u8], response: Option<&[u8]>) -> Exchange {
+        Exchange {
+            host: host.into(),
+            ..ex(request, response)
+        }
+    }
+
+    #[test]
+    fn count_and_list_range_with_filters() {
+        let s = Store::in_memory().unwrap();
+        let batch = [
+            host_ex(
+                "a.com",
+                b"GET /x HTTP/1.1\r\n\r\n",
+                Some(b"HTTP/1.1 200 OK\r\n\r\n"),
+            ),
+            host_ex(
+                "b.com",
+                b"POST /100%_done HTTP/1.1\r\n\r\n",
+                Some(b"HTTP/1.1 404 NF\r\n\r\n"),
+            ),
+            host_ex("A.COM", b"GET /y HTTP/1.1\r\n\r\n", None),
+        ];
+        s.insert_batch(&batch).unwrap();
+        let all = Filter::default();
+        assert_eq!(s.count(&all).unwrap(), 3);
+        let ids = |f: &Filter| {
+            s.list_range(0, 10, f)
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&all), [1, 2, 3]);
+        assert_eq!(s.list_range(1, 1, &all).unwrap()[0].id, 2);
+        assert_eq!(
+            ids(&Filter {
+                text: "a.com".into()
+            }),
+            [1, 3],
+            "case-insensitive"
+        );
+        assert_eq!(
+            ids(&Filter {
+                text: "POST".into()
+            }),
+            [2]
+        );
+        assert_eq!(ids(&Filter { text: "404".into() }), [2]);
+        assert_eq!(
+            ids(&Filter { text: "%_".into() }),
+            [2],
+            "wildcards in the filter are literal"
+        );
+        assert_eq!(ids(&Filter { text: "x".into() }), [1]);
+        assert_eq!(
+            s.count(&Filter {
+                text: "nothing".into()
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.count(&Filter { text: "  ".into() }).unwrap(),
+            3,
+            "blank matches all"
+        );
+    }
+
+    #[test]
+    fn read_only_open_checks_schema_and_cannot_write() {
+        let path = std::env::temp_dir().join(format!("mantis-ro-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let w = Store::open(&path).unwrap();
+            w.insert(&ex(b"GET / HTTP/1.1\r\n\r\n", None)).unwrap();
+            let ro = Store::open_read_only(&path).unwrap();
+            assert_eq!(ro.count(&Filter::default()).unwrap(), 1);
+            assert!(ro.insert(&ex(b"GET / HTTP/1.1\r\n\r\n", None)).is_err());
+            w.insert(&ex(b"GET /2 HTTP/1.1\r\n\r\n", None)).unwrap();
+            assert_eq!(
+                ro.count(&Filter::default()).unwrap(),
+                2,
+                "sees later writes"
+            );
+        }
+        let old = std::env::temp_dir().join(format!("mantis-ro-old-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&old);
+        Connection::open(&old)
+            .unwrap()
+            .pragma_update(None, "user_version", 1u32)
+            .unwrap();
+        assert!(matches!(
+            Store::open_read_only(&old),
+            Err(StoreError::NeedsMigration { found: 1, .. })
+        ));
+        Connection::open(&old)
+            .unwrap()
+            .pragma_update(None, "user_version", LATEST + 1)
+            .unwrap();
+        assert!(matches!(
+            Store::open_read_only(&old),
+            Err(StoreError::NewerSchema { .. })
+        ));
+        for p in [&path, &old] {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", p.display()));
+            }
+        }
     }
 
     #[test]
