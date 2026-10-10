@@ -1,5 +1,6 @@
 //! The egui application: thin drawing code over the models.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,10 +9,14 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use mantis_core::view::RequestView;
 use mantis_core::{Store, Stored};
+use serde::{Deserialize, Serialize};
 
+use crate::backend::{Backend, Cmd, Event};
 use crate::bench::Bench;
 use crate::data::{self, DataHandle, Resp};
 use crate::history::HistoryModel;
+use crate::scope_editor::ScopeEditor;
+use crate::settings::ProxySettings;
 use crate::timefmt::format_utc;
 use crate::viewer::RawView;
 
@@ -127,13 +132,44 @@ struct BenchDrive {
     started: bool,
 }
 
+/// Which page the central area shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Page {
+    History,
+    Proxy,
+    Scope,
+}
+
+/// What the background proxy is doing, as far as the UI knows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyState {
+    Stopped,
+    Starting,
+    Running(SocketAddr),
+    Stopping,
+}
+
+/// What is remembered between runs. The insecure and network-exposure
+/// switches are deliberately not part of it: they start off every time.
+#[derive(Default, Serialize, Deserialize)]
+struct Prefs {
+    project: Option<String>,
+    listen: Option<String>,
+    ca_dir: String,
+    scope: ScopeEditor,
+}
+
+const PREFS_KEY: &str = "mantis-prefs";
+
 /// The Mantis window.
 pub struct App {
-    path_input: String,
+    pub(crate) path_input: String,
+    pub(crate) project: Option<PathBuf>,
     data: Option<DataHandle>,
-    history: HistoryModel,
+    pub(crate) history: HistoryModel,
     filter_input: String,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) notice: Option<String>,
     detail: Option<Detail>,
     last_refresh: Instant,
     bench: Option<BenchDrive>,
@@ -141,6 +177,16 @@ pub struct App {
     viewer_scroll: Option<f32>,
     /// Deepest history row and viewer row drawn, to confirm a `--bench` run really scrolled.
     deepest: (usize, usize),
+    pub(crate) page: Page,
+    pub(crate) backend: Backend,
+    pub(crate) proxy: ProxyState,
+    pub(crate) settings: ProxySettings,
+    pub(crate) scope: ScopeEditor,
+    pub(crate) scope_file: String,
+    pub(crate) ca_export: String,
+    pub(crate) fingerprint: Option<String>,
+    /// The running proxy was started without origin certificate verification.
+    pub(crate) running_insecure: bool,
 }
 
 fn status_color(code: u16) -> Color32 {
@@ -153,17 +199,42 @@ fn status_color(code: u16) -> Color32 {
 }
 
 impl App {
-    /// A window, optionally opening `path` right away.
-    pub fn new(ctx: &egui::Context, path: Option<PathBuf>, bench: bool) -> Self {
+    /// A window, optionally opening `path` right away (otherwise the last project).
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: Option<PathBuf>,
+        bench: bool,
+    ) -> std::io::Result<Self> {
+        let ctx = &cc.egui_ctx;
+        let prefs: Prefs = if bench {
+            Prefs::default()
+        } else {
+            cc.storage
+                .and_then(|s| eframe::get_value(s, PREFS_KEY))
+                .unwrap_or_default()
+        };
+        let wake = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        };
+        let mut settings = ProxySettings::default();
+        if let Some(l) = prefs.listen {
+            settings.listen = l;
+        }
+        settings.ca_dir = prefs.ca_dir;
+        let last = prefs.project.map(PathBuf::from).filter(|p| p.exists());
+        let path = path.or(last);
         let mut app = App {
             path_input: path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            project: None,
             data: None,
             history: HistoryModel::new(),
             filter_input: String::new(),
             error: None,
+            notice: None,
             detail: None,
             last_refresh: Instant::now(),
             bench: bench.then(|| BenchDrive {
@@ -173,15 +244,24 @@ impl App {
             table_scroll: None,
             viewer_scroll: None,
             deepest: (0, 0),
+            page: Page::History,
+            backend: Backend::spawn(wake)?,
+            proxy: ProxyState::Stopped,
+            settings,
+            scope: prefs.scope,
+            scope_file: String::new(),
+            ca_export: String::new(),
+            fingerprint: None,
+            running_insecure: false,
         };
         if let Some(p) = path {
             app.open(ctx, &p);
         }
-        app
+        Ok(app)
     }
 
     /// Open (creating or migrating if needed) the project database and start reading it.
-    fn open(&mut self, ctx: &egui::Context, path: &Path) {
+    pub(crate) fn open(&mut self, ctx: &egui::Context, path: &Path) {
         let wake = {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
@@ -194,12 +274,79 @@ impl App {
         match opened {
             Ok(h) => {
                 self.data = Some(h);
+                self.project = Some(path.to_path_buf());
                 self.history = HistoryModel::new();
                 self.detail = None;
                 self.filter_input.clear();
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("cannot open {}: {e}", path.display())),
+        }
+    }
+
+    /// Validate the forms and ask the backend to start the proxy.
+    pub(crate) fn start_proxy(&mut self) {
+        let Some(project) = self.project.clone() else {
+            self.error = Some("Open or create a project first (top bar).".into());
+            return;
+        };
+        let scope = match self.scope.compile() {
+            Ok(s) => s,
+            Err(_) => {
+                self.error = Some("Fix the scope rules first (Scope page).".into());
+                return;
+            }
+        };
+        match self.settings.to_start(&project, scope) {
+            Ok(cfg) => {
+                self.running_insecure = cfg.insecure_upstream;
+                self.error = None;
+                self.proxy = ProxyState::Starting;
+                self.backend.send(Cmd::Start(cfg));
+            }
+            Err(msg) => self.error = Some(msg),
+        }
+    }
+
+    pub(crate) fn stop_proxy(&mut self) {
+        self.proxy = ProxyState::Stopping;
+        self.backend.send(Cmd::Stop);
+    }
+
+    /// Take in what the background runtime reports.
+    fn pump_backend(&mut self) {
+        for _ in 0..256 {
+            let Some(ev) = self.backend.try_recv() else {
+                break;
+            };
+            match ev {
+                Event::Started { addr, fingerprint } => {
+                    self.proxy = ProxyState::Running(addr);
+                    self.fingerprint = Some(fingerprint);
+                    self.error = None;
+                }
+                Event::Stopped => {
+                    self.proxy = ProxyState::Stopped;
+                    self.running_insecure = false;
+                }
+                Event::Logged => {
+                    self.backend.ack_logged();
+                    self.history.refresh();
+                }
+                Event::CaExported { path, fingerprint } => {
+                    self.notice = Some(format!(
+                        "CA certificate written to {} (SHA-256 {fingerprint})",
+                        path.display()
+                    ));
+                }
+                Event::Error(msg) => {
+                    if self.proxy == ProxyState::Starting {
+                        self.proxy = ProxyState::Stopped;
+                        self.running_insecure = false;
+                    }
+                    self.error = Some(msg);
+                }
+            }
         }
     }
 
@@ -286,15 +433,18 @@ impl App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Project");
-                let r = ui.add(
+                let idle = self.proxy == ProxyState::Stopped;
+                let r = ui.add_enabled(
+                    idle,
                     egui::TextEdit::singleline(&mut self.path_input)
                         .desired_width(360.0)
                         .hint_text("path/to/project.db"),
                 );
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("Open / create").clicked() || enter)
-                    && !self.path_input.trim().is_empty()
-                {
+                let clicked = ui
+                    .add_enabled(idle, egui::Button::new("Open / create"))
+                    .clicked();
+                if (clicked || enter) && !self.path_input.trim().is_empty() {
                     let p = PathBuf::from(self.path_input.trim());
                     self.open(&ctx, &p);
                 }
@@ -314,9 +464,67 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} rows", self.history.total()));
             });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.page, Page::History, "History");
+                ui.selectable_value(&mut self.page, Page::Proxy, "Proxy");
+                ui.selectable_value(&mut self.page, Page::Scope, "Scope");
+            });
             if let Some(e) = &self.error {
                 ui.colored_label(Color32::from_rgb(230, 100, 100), e);
             }
+            if let Some(n) = &self.notice {
+                ui.colored_label(Color32::from_rgb(110, 190, 130), n);
+            }
+        });
+    }
+
+    /// A red bar that stays visible whenever origin certificates are not being verified.
+    fn insecure_banner(&self, ui: &mut egui::Ui) {
+        if !(self.settings.insecure_upstream || self.running_insecure) {
+            return;
+        }
+        let active = if self.running_insecure {
+            " (active in the running proxy)"
+        } else {
+            " (takes effect when the proxy is started)"
+        };
+        egui::Panel::top("insecure-banner")
+            .frame(egui::Frame::new().fill(Color32::from_rgb(150, 30, 30)).inner_margin(6))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("INSECURE: origin server certificates are NOT being verified{active}. Only use this for lab targets."))
+                        .color(Color32::WHITE)
+                        .strong(),
+                );
+            });
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                match self.proxy {
+                    ProxyState::Stopped => ui.weak("Proxy stopped"),
+                    ProxyState::Starting => ui.label("Proxy starting…"),
+                    ProxyState::Running(a) => ui.colored_label(
+                        Color32::from_rgb(90, 190, 110),
+                        format!("Proxy listening on {a}"),
+                    ),
+                    ProxyState::Stopping => ui.label("Proxy stopping…"),
+                };
+                ui.separator();
+                match &self.project {
+                    Some(p) => ui.label(p.display().to_string()),
+                    None => ui.weak("no project open"),
+                };
+                if self.scope.enabled {
+                    ui.separator();
+                    ui.label("scope on");
+                }
+                if self.settings.allow_non_loopback {
+                    ui.separator();
+                    ui.colored_label(Color32::from_rgb(235, 170, 70), "network access allowed");
+                }
+            });
         });
     }
 
@@ -488,20 +696,36 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.pump_backend();
         self.pump(&ctx);
         self.drive_bench(&ctx);
+        self.insecure_banner(ui);
         self.top_bar(ui);
-        egui::Panel::bottom("viewer")
-            .resizable(true)
-            .default_size(340.0)
-            .show(ui, |ui| self.viewer(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.data.is_some() {
-                self.history_table(ui);
-            } else {
+        self.status_bar(ui);
+        if self.page == Page::History {
+            egui::Panel::bottom("viewer")
+                .resizable(true)
+                .default_size(340.0)
+                .show(ui, |ui| self.viewer(ui));
+        }
+        egui::CentralPanel::default().show(ui, |ui| match self.page {
+            Page::History if self.data.is_some() => self.history_table(ui),
+            Page::History => {
                 ui.weak("Open a project database (or create a new one) to begin.");
             }
+            Page::Proxy => self.proxy_page(ui),
+            Page::Scope => self.scope_page(ui),
         });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let prefs = Prefs {
+            project: self.project.as_ref().map(|p| p.display().to_string()),
+            listen: Some(self.settings.listen.clone()),
+            ca_dir: self.settings.ca_dir.clone(),
+            scope: self.scope.clone(),
+        };
+        eframe::set_value(storage, PREFS_KEY, &prefs);
     }
 }
 

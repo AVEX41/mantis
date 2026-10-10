@@ -12,7 +12,7 @@ mod target;
 mod tls;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use mantis_core::wire::Limits;
 use mantis_core::{Exchange, Scope, Store, Summary, WsDir, WsFrame};
@@ -127,6 +127,7 @@ pub struct ProxyHandle {
     writer: std::thread::JoinHandle<()>,
     intercept: intercept::Intercept,
     rewriter: rewrite::Rewriter,
+    scope: Arc<RwLock<Option<Arc<Scope>>>>,
 }
 
 impl ProxyHandle {
@@ -138,6 +139,12 @@ impl ProxyHandle {
     /// The intercept queue (off until enabled).
     pub fn intercept(&self) -> intercept::Intercept {
         self.intercept.clone()
+    }
+
+    /// Replace the scope while running. `None` puts everything in scope.
+    /// Exchanges already in flight keep the verdict they started with.
+    pub fn set_scope(&self, scope: Option<Scope>) {
+        *self.scope.write().unwrap_or_else(|p| p.into_inner()) = scope.map(Arc::new);
     }
 
     /// The match-and-replace rules; they can be replaced while running.
@@ -172,6 +179,7 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
     }
     let listener = TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
+    let scope = Arc::new(RwLock::new(config.scope.map(Arc::new)));
     let rewriter = rewrite::Rewriter::new(config.rewrite)?;
     let intercept = intercept::Intercept::new();
     let mitm = match &config.ca {
@@ -192,7 +200,7 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         })?;
     let ctx = Arc::new(conn::Ctx {
         listen: addr,
-        scope: config.scope,
+        scope: scope.clone(),
         limits: config.limits,
         log: log_tx,
         mitm,
@@ -232,6 +240,7 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         writer,
         intercept,
         rewriter,
+        scope,
     })
 }
 

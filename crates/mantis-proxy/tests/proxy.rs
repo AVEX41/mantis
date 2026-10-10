@@ -374,3 +374,53 @@ async fn non_loopback_bind_is_refused_by_default() {
         Err(ProxyError::NonLoopback(_))
     ));
 }
+
+#[tokio::test]
+async fn the_scope_can_be_replaced_while_the_proxy_runs() {
+    let origin = Origin::start(&[OK5], false).await;
+    let mut scope = Scope::new();
+    scope
+        .push(RuleSpec {
+            action: Action::Include,
+            host: "elsewhere.example".into(),
+            ports: vec![],
+            path: None,
+        })
+        .unwrap();
+    let mut rig = Rig::start(Some(scope)).await;
+    // Out of scope: forwarded, not logged.
+    client(rig.addr(), &[(&get(origin.addr, "/before"), None)]).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rig.events.recv())
+            .await
+            .is_err()
+    );
+
+    let mut now_in = Scope::new();
+    now_in
+        .push(RuleSpec {
+            action: Action::Include,
+            host: "127.0.0.1".into(),
+            ports: vec![origin.addr.port().to_string()],
+            path: None,
+        })
+        .unwrap();
+    rig.proxy.set_scope(Some(now_in));
+    client(rig.addr(), &[(&get(origin.addr, "/during"), None)]).await;
+    assert_eq!(
+        rig.next_event().await.path.as_deref(),
+        Some(&format!("http://{}/during", origin.addr)[..])
+    );
+
+    rig.proxy.set_scope(None); // everything in scope again
+    client(rig.addr(), &[(&get(origin.addr, "/after"), None)]).await;
+    assert!(rig
+        .next_event()
+        .await
+        .path
+        .as_deref()
+        .unwrap()
+        .ends_with("/after"));
+    assert_eq!(rig.store().list(10, 0).unwrap().len(), 2);
+    rig.finish().await;
+}

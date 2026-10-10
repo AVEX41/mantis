@@ -4,8 +4,12 @@
 //! (`history`, `viewer`, `data`) so it is covered by ordinary tests.
 
 pub mod app;
+pub mod backend;
 pub mod bench;
 pub mod data;
 pub mod history;
+mod pages;
+pub mod scope_editor;
+pub mod settings;
 pub mod timefmt;
 pub mod viewer;

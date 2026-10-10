@@ -5,7 +5,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -30,7 +30,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct Ctx {
     pub listen: SocketAddr,
-    pub scope: Option<Scope>,
+    /// Replaceable while running (see `ProxyHandle::set_scope`).
+    pub scope: Arc<RwLock<Option<Arc<Scope>>>>,
     pub limits: Limits,
     pub log: mpsc::Sender<LogCmd>,
     /// `None`: no CA configured, `CONNECT` is refused with 501.
@@ -95,7 +96,7 @@ async fn tunnel_connect(
     let intercept = ctx
         .mitm
         .as_ref()
-        .filter(|_| ctx.scope.as_ref().is_none_or(|s| s.may_match(&host, port)));
+        .filter(|_| ctx.scope().is_none_or(|s| s.may_match(&host, port)));
     let Some(mitm) = intercept else {
         let up =
             match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
@@ -200,8 +201,13 @@ struct Record {
 }
 
 impl Ctx {
+    /// The scope in force right now (`None`: everything is in scope).
+    fn scope(&self) -> Option<Arc<Scope>> {
+        self.scope.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     fn loggable(&self, d: &Dest) -> bool {
-        self.scope.as_ref().is_none_or(|s| {
+        self.scope().is_none_or(|s| {
             matches!(
                 s.check(&Target {
                     host: &d.host,

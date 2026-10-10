@@ -23,6 +23,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Mantis",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, path.clone(), bench)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, path.clone(), bench)?))),
     )
 }

@@ -13,12 +13,15 @@ mantis-fuzz = { path = "../mantis-fuzz" }
 mantis-entropy = { path = "../mantis-entropy" }
 mantis-scan = { path = "../mantis-scan" }
 mantis-ext = { path = "../mantis-ext" }
-eframe = "0.36"
+eframe = { version = "0.36", features = ["persistence"] }
 egui_extras = "0.36"
 memchr = "2.8.3"
 thiserror = "2.0.21"
 bytes = "1.12.1"
 anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
