@@ -179,6 +179,8 @@ pub struct App {
     viewer_scroll: Option<f32>,
     /// Deepest history row and viewer row drawn, to confirm a `--bench` run really scrolled.
     deepest: (usize, usize),
+    /// Vertical scroll offset of the history table as of the last frame.
+    table_offset: f32,
     pub(crate) page: Page,
     pub(crate) backend: Backend,
     pub(crate) proxy: ProxyState,
@@ -247,6 +249,7 @@ impl App {
             table_scroll: None,
             viewer_scroll: None,
             deepest: (0, 0),
+            table_offset: 0.0,
             page: Page::History,
             backend: Backend::spawn(wake)?,
             proxy: ProxyState::Stopped,
@@ -549,6 +552,12 @@ impl App {
     }
 
     fn history_table(&mut self, ui: &mut egui::Ui) {
+        // New rows push everything down; keep the rows being read where they are.
+        let added = self.history.take_added();
+        if added > 0 && self.table_offset > 0.5 && self.table_scroll.is_none() {
+            let step = TABLE_ROW_H + ui.spacing().item_spacing.y;
+            self.table_scroll = Some(self.table_offset + added as f32 * step);
+        }
         let total = self.history.total();
         let selected = self.history.selected();
         let mut clicked = None;
@@ -570,7 +579,7 @@ impl App {
         if let Some(o) = self.table_scroll.take() {
             table = table.vertical_scroll_offset(o);
         }
-        table
+        let out = table
             .header(20.0, |mut h| {
                 for t in [
                     "#",
@@ -638,6 +647,7 @@ impl App {
                     }
                 });
             });
+        self.table_offset = out.state.offset.y;
         if let Some(id) = clicked {
             self.history.select(id);
         }

@@ -60,6 +60,12 @@ cargo run --release -p mantis-ui -- /tmp/big.db
 body in Text and Hex, prints frame-interval percentiles and memory, and exits. Numbers depend on the
 machine and display; the acceptance bar is no frame over 20 ms in the scripted run.
 
+## No blocking during proxying
+`crates/mantis-ui/tests/load.rs` pushes 2,000 requests through a real proxy from 8 clients while a
+simulated UI loop does each frame's work (draining backend events, paging the history). The slowest
+frame's worth of work is asserted to stay far below a frame budget, and every exchange must reach the
+history. New rows arriving while you are scrolled down no longer move what you are reading.
+
 ## How it is built
 The window draws; the models decide. `HistoryModel` pages rows on demand through a reader thread that
 owns a read-only database connection, so the UI thread never touches SQLite. `RawView` indexes a

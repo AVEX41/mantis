@@ -20,9 +20,12 @@ pub struct HistoryModel {
     pages: HashMap<usize, Vec<Summary>>,
     pending: HashSet<usize>,
     count_inflight: bool,
+    /// A refresh was asked for while a count was already on its way, so that count may be stale.
+    recount: bool,
     outbox: Vec<Req>,
     focus_page: usize,
     selected: Option<i64>,
+    added: usize,
 }
 
 impl Default for HistoryModel {
@@ -41,9 +44,11 @@ impl HistoryModel {
             pages: HashMap::new(),
             pending: HashSet::new(),
             count_inflight: false,
+            recount: false,
             outbox: Vec::new(),
             focus_page: 0,
             selected: None,
+            added: 0,
         };
         m.refresh();
         m
@@ -73,6 +78,7 @@ impl HistoryModel {
         self.filter.text = text.to_string();
         self.gen += 1;
         self.total = 0;
+        self.added = 0;
         self.pages.clear();
         self.pending.clear();
         self.count_inflight = false;
@@ -81,7 +87,9 @@ impl HistoryModel {
 
     /// Ask for a fresh row count (new traffic shows up through this).
     pub fn refresh(&mut self) {
-        if !self.count_inflight {
+        if self.count_inflight {
+            self.recount = true;
+        } else {
             self.count_inflight = true;
             self.outbox.push(Req::Count {
                 gen: self.gen,
@@ -111,6 +119,12 @@ impl HistoryModel {
         self.pages.get(&page).and_then(|p| p.get(asc % PAGE))
     }
 
+    /// Rows that appeared (newest first, so everything below them moved down)
+    /// since the last call. The view uses it to keep what you are reading in place.
+    pub fn take_added(&mut self) -> usize {
+        std::mem::take(&mut self.added)
+    }
+
     /// Requests to forward to the reader.
     pub fn drain_requests(&mut self) -> Vec<Req> {
         std::mem::take(&mut self.outbox)
@@ -126,12 +140,18 @@ impl HistoryModel {
                         self.pages.clear();
                         self.pending.clear();
                     } else if total > self.total {
+                        if self.total > 0 {
+                            self.added += total - self.total;
+                        }
                         // The old last page was partial; drop it and anything beyond.
                         let first_stale = self.total / PAGE;
                         self.pages.retain(|&p, _| p < first_stale);
                         self.pending.retain(|&p| p < first_stale);
                     }
                     self.total = total;
+                    if std::mem::take(&mut self.recount) {
+                        self.refresh();
+                    }
                 }
                 None
             }
@@ -255,6 +275,39 @@ mod tests {
         serve(&mut m, 460);
         assert_eq!(m.row(0).map(|s| s.id), Some(460));
         assert_eq!(m.row(10).map(|s| s.id), Some(450));
+    }
+
+    #[test]
+    fn a_refresh_during_a_count_is_not_lost() {
+        let mut m = HistoryModel::new(); // count #1 in flight
+        m.drain_requests();
+        m.refresh(); // new traffic arrives while that count may already be stale
+        assert!(m.drain_requests().is_empty(), "one count at a time");
+        m.apply(Resp::Count { gen: 0, total: 10 });
+        let again = m.drain_requests();
+        assert!(
+            matches!(again[..], [Req::Count { gen: 0, .. }]),
+            "asks again once the first answer is in"
+        );
+        m.apply(Resp::Count { gen: 0, total: 12 });
+        assert_eq!(m.total(), 12);
+        assert!(m.drain_requests().is_empty(), "and then stops");
+    }
+
+    #[test]
+    fn rows_added_after_the_first_count_are_reported_once() {
+        let mut m = HistoryModel::new();
+        serve(&mut m, 450);
+        assert_eq!(m.take_added(), 0, "the initial load is not new traffic");
+        m.refresh();
+        serve(&mut m, 460);
+        m.refresh();
+        serve(&mut m, 465);
+        assert_eq!(m.take_added(), 15);
+        assert_eq!(m.take_added(), 0);
+        m.set_filter("x");
+        serve(&mut m, 3);
+        assert_eq!(m.take_added(), 0, "a filter change is not new traffic");
     }
 
     #[test]
