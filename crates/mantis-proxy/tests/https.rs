@@ -183,6 +183,16 @@ async fn open_tunnel(
     sni: &str,
     trust: &CertificateDer<'static>,
 ) -> Result<Tunnel, String> {
+    open_tunnel_alpn(proxy, target, sni, trust, &[b"h2", b"http/1.1"]).await
+}
+
+async fn open_tunnel_alpn(
+    proxy: SocketAddr,
+    target: &str,
+    sni: &str,
+    trust: &CertificateDer<'static>,
+    alpn: &[&[u8]],
+) -> Result<Tunnel, String> {
     let s = TcpStream::connect(proxy).await.unwrap();
     let (r, mut w) = s.into_split();
     write_raw(
@@ -206,7 +216,7 @@ async fn open_tunnel(
     let (rh, left) = r.into_parts();
     assert!(left.is_empty());
     let stream = rh.reunite(w).unwrap();
-    let connector = TlsConnector::from(client_cfg(trust, &[b"h2", b"http/1.1"]));
+    let connector = TlsConnector::from(client_cfg(trust, alpn));
     let tls = tokio::time::timeout(
         T,
         connector.connect(ServerName::try_from(sni.to_string()).unwrap(), stream),
@@ -565,5 +575,95 @@ async fn the_intercept_queue_works_inside_an_intercepted_tunnel() {
         (row.tls, &row.request[..], row.request_original.as_deref()),
         (true, &edited[..], Some(&original[..]))
     );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn an_http2_only_client_is_turned_away_cleanly() {
+    let origin = TlsOrigin::start("127.0.0.1", &[OK5]).await;
+    let mut rig = Rig::start(Opts {
+        scope: None,
+        trust_origin: Some(origin.ca_der.clone()),
+        insecure: false,
+    })
+    .await;
+    let target = origin.addr.to_string();
+    let err = open_tunnel_alpn(
+        rig.proxy.local_addr(),
+        &target,
+        "127.0.0.1",
+        &rig.ca_der,
+        &[b"h2"],
+    )
+    .await
+    .err()
+    .expect("an h2-only client cannot be served");
+    assert!(err.to_lowercase().contains("protocol"), "{err}");
+    // HTTP/1.1 clients are unaffected.
+    let mut t = open_tunnel(rig.proxy.local_addr(), &target, "127.0.0.1", &rig.ca_der)
+        .await
+        .unwrap();
+    assert_eq!(ask(&mut t, &get("/", &target)).await, OK5);
+    assert_eq!(rig.next_event().await.status, Some(200));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn wss_frames_are_captured_inside_the_tls_tunnel() {
+    const REPLY: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n\x81\x05hello";
+    let origin = TlsOrigin::start("127.0.0.1", &[REPLY]).await;
+    let rig = Rig::start(Opts {
+        scope: None,
+        trust_origin: Some(origin.ca_der.clone()),
+        insecure: false,
+    })
+    .await;
+    let mut ws = rig.proxy.subscribe_ws();
+    let target = origin.addr.to_string();
+    let mut t = open_tunnel(rig.proxy.local_addr(), &target, "127.0.0.1", &rig.ca_der)
+        .await
+        .unwrap();
+    let upgrade = format!("GET /ws HTTP/1.1\r\nHost: {target}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    write_raw(&mut t.1, upgrade.as_bytes()).await.unwrap();
+    let head = tokio::time::timeout(T, t.0.read_response(None))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.framing, Framing::HeadOnly);
+    let mut got = t.0.take_buffered().to_vec();
+    while got.len() < 7 {
+        let mut b = [0u8; 16];
+        let n = tokio::time::timeout(T, t.0.get_mut().read(&mut b))
+            .await
+            .expect("frame stalled")
+            .unwrap();
+        assert!(n > 0);
+        got.extend(&b[..n]);
+    }
+    assert_eq!(got, b"\x81\x05hello");
+    write_raw(&mut t.1, &[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2])
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let e = tokio::time::timeout(T, ws.recv())
+            .await
+            .expect("frame not captured")
+            .unwrap();
+        seen.push((e.dir, e.opcode, e.payload_len));
+    }
+    seen.sort_by_key(|s| s.2);
+    assert_eq!(
+        seen,
+        [
+            (mantis_core::WsDir::ToServer, 1, 2),
+            (mantis_core::WsDir::ToClient, 1, 5)
+        ]
+    );
+    let frames = rig.store().ws_frames(1).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert!(rig.store().get(1).unwrap().unwrap().exchange.tls);
     rig.finish().await;
 }

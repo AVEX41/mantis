@@ -15,10 +15,42 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mantis_core::wire::Limits;
-use mantis_core::{Exchange, Scope, Store, Summary};
+use mantis_core::{Exchange, Scope, Store, Summary, WsDir, WsFrame};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+
+/// What the store writer thread is asked to do.
+pub(crate) enum LogCmd {
+    /// Store an exchange; send back its id if someone is waiting for it.
+    Exchange {
+        ex: Exchange,
+        reply: Option<oneshot::Sender<i64>>,
+    },
+    /// Store a WebSocket frame of an already stored exchange.
+    Frame(WsFrame),
+}
+
+/// A WebSocket frame that was just stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsEvent {
+    /// Row id of the frame.
+    pub id: i64,
+    /// The exchange it belongs to.
+    pub exchange_id: i64,
+    /// Direction of travel.
+    pub dir: WsDir,
+    /// Opcode from the frame header.
+    pub opcode: u8,
+    /// FIN bit.
+    pub fin: bool,
+    /// Compressed with permessage-deflate (RSV1).
+    pub compressed: bool,
+    /// Real payload length.
+    pub payload_len: u64,
+    /// Only part of the payload was stored.
+    pub truncated: bool,
+}
 
 /// Direction of a message through the proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +121,7 @@ pub enum ProxyError {
 pub struct ProxyHandle {
     addr: SocketAddr,
     events: broadcast::Sender<Summary>,
+    ws_events: broadcast::Sender<WsEvent>,
     stop: oneshot::Sender<()>,
     accept: JoinHandle<()>,
     writer: std::thread::JoinHandle<()>,
@@ -115,6 +148,11 @@ impl ProxyHandle {
     /// Receive a [`Summary`] for each exchange as it is stored.
     pub fn subscribe(&self) -> broadcast::Receiver<Summary> {
         self.events.subscribe()
+    }
+
+    /// Receive a [`WsEvent`] for each captured WebSocket frame.
+    pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
+        self.ws_events.subscribe()
     }
 
     /// Stop accepting, drop open connections, and wait for the store writer to drain.
@@ -144,12 +182,13 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
         None => None,
     };
     let (events, _) = broadcast::channel(256);
-    let (log_tx, log_rx) = mpsc::channel::<Exchange>(1024);
+    let (ws_events, _) = broadcast::channel(1024);
+    let (log_tx, log_rx) = mpsc::channel::<LogCmd>(1024);
     let writer = std::thread::Builder::new()
         .name("mantis-store".into())
         .spawn({
-            let events = events.clone();
-            move || write_loop(store, log_rx, events)
+            let (events, ws_events) = (events.clone(), ws_events.clone());
+            move || write_loop(store, log_rx, events, ws_events)
         })?;
     let ctx = Arc::new(conn::Ctx {
         listen: addr,
@@ -187,6 +226,7 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
     Ok(ProxyHandle {
         addr,
         events,
+        ws_events,
         stop,
         accept,
         writer,
@@ -195,14 +235,44 @@ pub async fn serve(config: Config, store: Store) -> Result<ProxyHandle, ProxyErr
     })
 }
 
-fn write_loop(store: Store, mut rx: mpsc::Receiver<Exchange>, events: broadcast::Sender<Summary>) {
-    while let Some(ex) = rx.blocking_recv() {
-        match store.insert(&ex).and_then(|id| store.summary(id)) {
-            Ok(Some(s)) => {
-                let _ = events.send(s); // no subscribers is fine
-            }
-            Ok(None) => tracing::error!("inserted row vanished"),
-            Err(e) => tracing::error!(error = %e, "failed to store exchange"),
+fn write_loop(
+    store: Store,
+    mut rx: mpsc::Receiver<LogCmd>,
+    events: broadcast::Sender<Summary>,
+    ws_events: broadcast::Sender<WsEvent>,
+) {
+    while let Some(cmd) = rx.blocking_recv() {
+        match cmd {
+            LogCmd::Exchange { ex, reply } => match store.insert(&ex) {
+                Ok(id) => {
+                    if let Some(r) = reply {
+                        let _ = r.send(id);
+                    }
+                    match store.summary(id) {
+                        Ok(Some(s)) => {
+                            let _ = events.send(s); // no subscribers is fine
+                        }
+                        Ok(None) => tracing::error!("inserted row vanished"),
+                        Err(e) => tracing::error!(error = %e, "failed to read back exchange"),
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "failed to store exchange"),
+            },
+            LogCmd::Frame(f) => match store.insert_ws_frame(&f) {
+                Ok(id) => {
+                    let _ = ws_events.send(WsEvent {
+                        id,
+                        exchange_id: f.exchange_id,
+                        dir: f.dir,
+                        opcode: f.opcode,
+                        fin: f.fin,
+                        compressed: f.compressed,
+                        payload_len: f.payload_len,
+                        truncated: f.truncated,
+                    });
+                }
+                Err(e) => tracing::error!(error = %e, "failed to store websocket frame"),
+            },
         }
     }
 }

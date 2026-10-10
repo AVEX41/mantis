@@ -108,3 +108,44 @@ pub fn now_micros() -> i64 {
         .and_then(|d| i64::try_from(d.as_micros()).ok())
         .unwrap_or(0)
 }
+
+/// Which way a WebSocket frame travelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDir {
+    /// Client to server.
+    ToServer,
+    /// Server to client.
+    ToClient,
+}
+
+/// One WebSocket frame belonging to an upgraded exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsFrame {
+    /// The exchange (upgrade request and `101` response) it belongs to.
+    pub exchange_id: i64,
+    /// Time the frame was completed, unix microseconds.
+    pub ts_micros: i64,
+    /// Direction of travel.
+    pub dir: WsDir,
+    /// Opcode from the frame header.
+    pub opcode: u8,
+    /// FIN bit.
+    pub fin: bool,
+    /// RSV1 bit (compressed with permessage-deflate).
+    pub compressed: bool,
+    /// Real payload length, even when `raw` was cut short.
+    pub payload_len: u64,
+    /// `raw` holds only part of the payload.
+    pub truncated: bool,
+    /// The frame exactly as on the wire (header plus payload, possibly truncated).
+    pub raw: Bytes,
+}
+
+/// A [`WsFrame`] with its storage id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWsFrame {
+    /// Row id.
+    pub id: i64,
+    /// The frame.
+    pub frame: WsFrame,
+}

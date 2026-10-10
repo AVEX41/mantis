@@ -7,6 +7,7 @@
 
 mod read;
 mod write;
+pub mod ws;
 
 #[cfg(test)]
 mod tests;

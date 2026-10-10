@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use mantis_core::{Scope, Store};
+use mantis_core::{Scope, Store, WsDir};
 use mantis_proxy::ca::Ca;
 use mantis_proxy::intercept::Decision;
 use mantis_proxy::{rewrite, Dir};
 use mantis_proxy::{serve, Config};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser)]
 #[command(version, about = "Mantis security-testing toolkit")]
@@ -183,10 +183,21 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(prompt(queue));
             }
             let mut events = proxy.subscribe();
+            let mut ws = proxy.subscribe_ws();
             tracing::info!(db = %db.display(), "logging to database; Ctrl-C to stop");
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
+                    Ok(f) = ws.recv() => println!(
+                        "ws #{} {} {} {}B{}{}",
+                        f.exchange_id,
+                        if f.dir == WsDir::ToServer { "->" } else { "<-" },
+                        opcode_name(f.opcode),
+                        f.payload_len,
+                        if f.compressed { " (compressed)" } else { "" },
+                        if f.truncated { " (truncated in store)" } else { "" },
+                    ),
+
                     Ok(s) = events.recv() => println!(
                         "#{} {} {}:{} {} -> {}",
                         s.id,
@@ -201,6 +212,18 @@ async fn main() -> anyhow::Result<()> {
             proxy.shutdown().await;
             Ok(())
         }
+    }
+}
+
+fn opcode_name(op: u8) -> &'static str {
+    match op {
+        0 => "continuation",
+        1 => "text",
+        2 => "binary",
+        8 => "close",
+        9 => "ping",
+        10 => "pong",
+        _ => "?",
     }
 }
 
@@ -238,7 +261,8 @@ async fn prompt(queue: mantis_proxy::intercept::Intercept) {
         );
         let decision = loop {
             print!("[f]orward / [d]rop? ");
-            let _ = tokio::io::stdout().flush().await;
+            // print! goes through std's buffer, so flush that one (not tokio's).
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             match lines.next_line().await {
                 Ok(Some(l)) if l.trim().eq_ignore_ascii_case("f") => break Decision::Forward,
                 Ok(Some(l)) if l.trim().eq_ignore_ascii_case("d") => break Decision::Drop,

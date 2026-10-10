@@ -4,25 +4,27 @@
 //! intercepted `CONNECT` tunnel; only the way the upstream is reached differs.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use mantis_core::view::{Header, RequestView, ResponseView};
+use mantis_core::wire::ws::{FrameScanner, DEFAULT_CAP};
 use mantis_core::wire::{write_raw, Framing, Limits, Message, Reader, WireError};
-use mantis_core::{now_micros, Exchange, Scope, Source, Target, Verdict};
+use mantis_core::{now_micros, Exchange, Scope, Source, Target, Verdict, WsDir, WsFrame};
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::intercept::{Decision, HoldOutcome, Intercept};
 use crate::rewrite::Rewriter;
 use crate::target::{connect_target, resolve, tunneled, Dest, Reject};
 use crate::tls::{self, Mitm};
-use crate::Dir;
+use crate::{Dir, LogCmd};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -30,7 +32,7 @@ pub(crate) struct Ctx {
     pub listen: SocketAddr,
     pub scope: Option<Scope>,
     pub limits: Limits,
-    pub log: mpsc::Sender<Exchange>,
+    pub log: mpsc::Sender<LogCmd>,
     /// `None`: no CA configured, `CONNECT` is refused with 501.
     pub mitm: Option<Mitm>,
     pub intercept: Intercept,
@@ -131,7 +133,7 @@ async fn tunnel_connect(
     let tls_stream = match TlsAcceptor::from(cfg).accept(stream).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(%host, port, error = %e, "client TLS handshake failed (is the Mantis CA trusted by the client?)");
+            tracing::warn!(%host, port, error = %e, hint = handshake_hint(&e), "client TLS handshake failed");
             return Ok(());
         }
     };
@@ -140,6 +142,16 @@ async fn tunnel_connect(
     let res = serve_requests(&mut client, &mut w, ctx, Mode::Tls { host: &host, port }).await;
     let _ = w.shutdown().await; // send close_notify so clients don't see a truncation
     res.map(drop)
+}
+
+/// Explain a failed client handshake in terms the user can act on.
+fn handshake_hint(e: &std::io::Error) -> &'static str {
+    match e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
+        Some(rustls::Error::NoApplicationProtocol) => {
+            "the client only speaks HTTP/2, which Mantis does not support (see docs/adr/0002-http2-downgrade.md)"
+        }
+        _ => "is the Mantis CA trusted by the client?",
+    }
 }
 
 fn reply(status: &str, body: &str) -> Vec<u8> {
@@ -210,11 +222,8 @@ impl Ctx {
                     .is_ok_and(|ip| ip.is_loopback() || ip == self.listen.ip()))
     }
 
-    async fn log(&self, d: &Dest, tls: bool, rec: Record) {
-        if !self.loggable(d) {
-            return;
-        }
-        let ex = Exchange {
+    fn exchange_for(d: &Dest, tls: bool, rec: Record) -> Exchange {
+        Exchange {
             ts_micros: rec.ts,
             source: Source::Proxy,
             host: d.host.clone(),
@@ -225,10 +234,39 @@ impl Ctx {
             request_original: rec.request_original,
             response_original: rec.response_original,
             dropped: rec.dropped,
-        };
-        if self.log.send(ex).await.is_err() {
+        }
+    }
+
+    async fn log(&self, d: &Dest, tls: bool, rec: Record) {
+        if !self.loggable(d) {
+            return;
+        }
+        let ex = Self::exchange_for(d, tls, rec);
+        if self
+            .log
+            .send(LogCmd::Exchange { ex, reply: None })
+            .await
+            .is_err()
+        {
             tracing::error!("store writer is gone; exchange not logged");
         }
+    }
+
+    /// Like [`Ctx::log`], but wait for the row id (None if out of scope or not stored).
+    async fn log_id(&self, d: &Dest, tls: bool, rec: Record) -> Option<i64> {
+        if !self.loggable(d) {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        let ex = Self::exchange_for(d, tls, rec);
+        self.log
+            .send(LogCmd::Exchange {
+                ex,
+                reply: Some(tx),
+            })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
 }
 
@@ -402,12 +440,19 @@ where
             return Ok(Outcome::Done);
         }
         write_raw(cw, &response).await?;
-        ctx.log(&dest, tls, rec).await;
+        let websocket = resp.framing == Framing::HeadOnly && is_websocket_upgrade(&response);
+        // WebSocket frames are stored against the upgrade exchange, so wait for its id.
+        let ws_exchange = if websocket {
+            ctx.log_id(&dest, tls, rec).await
+        } else {
+            ctx.log(&dest, tls, rec).await;
+            None
+        };
         tracing::info!(host = %dest.host, port = dest.port, tls, bytes = response.len(), "exchange");
 
         if resp.framing == Framing::HeadOnly {
             if let Some(up) = upstream.take() {
-                tunnel(client, cw, up).await?;
+                tunnel(client, cw, up, ws_exchange.map(|id| (&ctx.log, id))).await?;
             }
             return Ok(Outcome::Done);
         }
@@ -534,22 +579,158 @@ async fn obtain_response<W: AsyncWrite + Unpin>(
     }
 }
 
-/// After a 101 the stream is no longer HTTP: copy bytes both ways (not captured yet).
-async fn tunnel<R, W>(client: &mut Reader<R>, cw: &mut W, mut up: Conn) -> std::io::Result<()>
+fn is_websocket_upgrade(response: &[u8]) -> bool {
+    let v = ResponseView::parse(response);
+    v.status == Some(101) && has_token(response, &v.headers, b"upgrade", b"websocket")
+}
+
+/// Stop recording WebSocket frames for one connection after this many stored bytes.
+const MAX_CAPTURE_BYTES: usize = 64 << 20;
+/// After one side of a tunnel ends, give the other this long to finish.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// Records the frames passing in one direction. It never touches the bytes.
+struct Scan<'a> {
+    log: &'a mpsc::Sender<LogCmd>,
+    exchange_id: i64,
+    dir: WsDir,
+    scanner: FrameScanner,
+    budget: &'a AtomicUsize,
+    stopped: bool,
+}
+
+impl Scan<'_> {
+    async fn feed(&mut self, data: &[u8]) {
+        if self.stopped {
+            return;
+        }
+        for f in self.scanner.feed(data) {
+            if self.budget.fetch_add(f.raw.len(), Ordering::SeqCst) + f.raw.len()
+                > MAX_CAPTURE_BYTES
+            {
+                tracing::warn!(
+                    exchange = self.exchange_id,
+                    "websocket capture limit reached; no further frames are stored"
+                );
+                self.stopped = true;
+                return;
+            }
+            let frame = WsFrame {
+                exchange_id: self.exchange_id,
+                ts_micros: now_micros(),
+                dir: self.dir,
+                opcode: f.opcode,
+                fin: f.fin,
+                compressed: f.rsv1,
+                payload_len: f.payload_len,
+                truncated: f.truncated,
+                raw: f.raw,
+            };
+            if self.log.send(LogCmd::Frame(frame)).await.is_err() {
+                self.stopped = true;
+                return;
+            }
+        }
+        if self.scanner.is_lost() {
+            tracing::warn!(
+                exchange = self.exchange_id,
+                "websocket capture lost: stream is not valid WebSocket framing (still forwarding)"
+            );
+            self.stopped = true;
+        }
+    }
+}
+
+/// Copy `r` to `w` as bytes arrive, then show them to the scanner. On end of
+/// input, close the write side so the peer sees it.
+async fn pump<R, W>(r: &mut R, w: &mut W, mut scan: Option<Scan<'_>>) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            let _ = w.shutdown().await;
+            return Ok(());
+        }
+        w.write_all(&buf[..n]).await?;
+        w.flush().await?;
+        if let Some(s) = scan.as_mut() {
+            s.feed(&buf[..n]).await;
+        }
+    }
+}
+
+/// After a 101 the stream is no longer HTTP: copy bytes both ways. With
+/// `capture` (log channel and upgrade exchange id) WebSocket frames are
+/// recorded on the side; forwarding never waits for or depends on that.
+async fn tunnel<R, W>(
+    client: &mut Reader<R>,
+    cw: &mut W,
+    mut up: Conn,
+    capture: Option<(&mpsc::Sender<LogCmd>, i64)>,
+) -> std::io::Result<()>
 where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
+    let budget = AtomicUsize::new(0);
+    let scan = |dir| {
+        capture.map(|(log, exchange_id)| Scan {
+            log,
+            exchange_id,
+            dir,
+            scanner: FrameScanner::new(DEFAULT_CAP),
+            budget: &budget,
+            stopped: false,
+        })
+    };
+    let (mut to_server, mut to_client) = (scan(WsDir::ToServer), scan(WsDir::ToClient));
     let (c_left, u_left) = (client.take_buffered(), up.reader.take_buffered());
     cw.write_all(&u_left).await?;
     up.writer.write_all(&c_left).await?;
     cw.flush().await?;
     up.writer.flush().await?;
+    if let Some(s) = to_client.as_mut() {
+        s.feed(&u_left).await;
+    }
+    if let Some(s) = to_server.as_mut() {
+        s.feed(&c_left).await;
+    }
     let ur = up.reader.get_mut();
     let uw = &mut up.writer;
     let cr = client.get_mut();
+    let a = pump(cr, uw, to_server);
+    let b = pump(ur, cw, to_client);
+    tokio::pin!(a, b);
     tokio::select! {
-        r = tokio::io::copy(cr, uw) => r.map(drop),
-        r = tokio::io::copy(ur, cw) => r.map(drop),
+        r = &mut a => {
+            let _ = tokio::time::timeout(DRAIN, &mut b).await;
+            r
+        }
+        r = &mut b => {
+            let _ = tokio::time::timeout(DRAIN, &mut a).await;
+            r
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handshake_hint;
+
+    #[test]
+    fn an_h2_only_client_gets_a_specific_hint() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::NoApplicationProtocol,
+        );
+        assert!(handshake_hint(&e).contains("HTTP/2"));
+        let other =
+            std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::DecryptError);
+        assert!(handshake_hint(&other).contains("trusted"));
+        assert!(handshake_hint(&std::io::Error::other("x")).contains("trusted"));
     }
 }

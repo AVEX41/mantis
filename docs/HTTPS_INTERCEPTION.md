@@ -17,7 +17,8 @@ Quick check without a browser: `curl --proxy http://127.0.0.1:8080 --cacert mant
 - With a scope, only targets whose host and port may be in scope are intercepted. Everything else is
   relayed as an untouched byte tunnel: no certificate is minted and nothing is logged.
   Path rules are applied per request inside the tunnel.
-- HTTP/2 is not implemented. Both sides are offered `http/1.1` only, so clients downgrade.
+- HTTP/2 is not implemented. Both sides are offered `http/1.1` only, so clients downgrade; clients that
+  require HTTP/2 (such as gRPC) cannot be proxied. See `docs/adr/0002-http2-downgrade.md`.
 
 ## Origin certificates
 Origin certificates are verified against the OS trust store. For lab targets with self-signed

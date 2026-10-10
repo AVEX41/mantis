@@ -5,13 +5,14 @@ use std::path::Path;
 use bytes::Bytes;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::message::{Exchange, Source, Stored, Summary};
+use crate::message::{Exchange, Source, Stored, StoredWsFrame, Summary, WsDir, WsFrame};
 use crate::view::{RequestView, ResponseView};
 
 /// Migrations in order; entry `i` upgrades `user_version` from `i` to `i + 1`.
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_originals.sql"),
+    include_str!("../migrations/0003_ws_frames.sql"),
 ];
 const LATEST: u32 = MIGRATIONS.len() as u32;
 
@@ -164,6 +165,55 @@ impl Store {
         .transpose()
     }
 
+    /// Store a WebSocket frame and return its id.
+    pub fn insert_ws_frame(&self, f: &WsFrame) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO ws_frames (exchange_id, ts, to_server, opcode, fin, compressed, payload_len, truncated, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                f.exchange_id,
+                f.ts_micros,
+                f.dir == WsDir::ToServer,
+                f.opcode,
+                f.fin,
+                f.compressed,
+                i64::try_from(f.payload_len).map_err(|_| StoreError::Corrupt("payload_len"))?,
+                f.truncated,
+                &f.raw[..]
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The frames of one exchange in the order they were stored.
+    pub fn ws_frames(&self, exchange_id: i64) -> Result<Vec<StoredWsFrame>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, to_server, opcode, fin, compressed, payload_len, truncated, raw
+             FROM ws_frames WHERE exchange_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([exchange_id], |r| {
+            Ok(StoredWsFrame {
+                id: r.get(0)?,
+                frame: WsFrame {
+                    exchange_id,
+                    ts_micros: r.get(1)?,
+                    dir: if r.get::<_, bool>(2)? {
+                        WsDir::ToServer
+                    } else {
+                        WsDir::ToClient
+                    },
+                    opcode: r.get(3)?,
+                    fin: r.get(4)?,
+                    compressed: r.get(5)?,
+                    payload_len: u64::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+                    truncated: r.get(7)?,
+                    raw: Bytes::from(r.get::<_, Vec<u8>>(8)?),
+                },
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Fetch one row summary without loading the raw bodies.
     pub fn summary(&self, id: i64) -> Result<Option<Summary>, StoreError> {
         self.conn
@@ -305,6 +355,41 @@ mod tests {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
+    }
+
+    #[test]
+    fn ws_frames_round_trip_in_order_per_exchange() {
+        let s = Store::in_memory().unwrap();
+        let a = s.insert(&ex(b"GET /ws HTTP/1.1\r\n\r\n", None)).unwrap();
+        let b = s.insert(&ex(b"GET /other HTTP/1.1\r\n\r\n", None)).unwrap();
+        let frame = |exchange_id, dir, raw: &'static [u8]| WsFrame {
+            exchange_id,
+            ts_micros: 5,
+            dir,
+            opcode: 1,
+            fin: true,
+            compressed: false,
+            payload_len: 99,
+            truncated: true,
+            raw: Bytes::from_static(raw),
+        };
+        let (f1, f2, f3) = (
+            frame(a, WsDir::ToServer, b"\x81\x00"),
+            frame(a, WsDir::ToClient, b"\x81\x01x"),
+            frame(b, WsDir::ToClient, b"\xff"),
+        );
+        for f in [&f1, &f2, &f3] {
+            s.insert_ws_frame(f).unwrap();
+        }
+        let got: Vec<_> = s
+            .ws_frames(a)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.frame)
+            .collect();
+        assert_eq!(got, vec![f1, f2]);
+        assert_eq!(s.ws_frames(b).unwrap().len(), 1);
+        assert!(s.ws_frames(999).unwrap().is_empty());
     }
 
     #[test]
